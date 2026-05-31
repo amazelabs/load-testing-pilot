@@ -1,0 +1,3754 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Distributed Load Testing on AWS - China Region adapted from SO0062 v4.0.15 (no auth, S3 static hosting, polling)"
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Container image" }
+        Parameters: [ContainerImage]
+      - Label: { default: "HTTPS configuration" }
+        Parameters: [CertificateArn, AlbIngressCidr]
+      - Label: { default: "Network configuration for Fargate tasks" }
+        Parameters: [ExistingVPCId, ExistingSubnetA, ExistingSubnetB, VpcCidrBlock, SubnetACidrBlock, SubnetBCidrBlock]
+
+Parameters:
+  ContainerImage:
+    Type: String
+    Description: "ECS Task container image URI (your China ECR, e.g. 1234.dkr.ecr.cn-north-1.amazonaws.com.cn/load-testing-pilot:v1)"
+    MinLength: 1
+
+  ExistingVPCId:
+    Type: String
+    Default: ""
+    AllowedPattern: "(?:^$|^vpc-[a-zA-Z0-9-]+)"
+    Description: "Existing VPC ID. Leave empty to let the stack create one."
+
+  ExistingSubnetA:
+    Type: String
+    Default: ""
+    AllowedPattern: "(?:^$|^subnet-[a-zA-Z0-9-]+)"
+
+  ExistingSubnetB:
+    Type: String
+    Default: ""
+    AllowedPattern: "(?:^$|^subnet-[a-zA-Z0-9-]+)"
+
+  VpcCidrBlock:
+    Type: String
+    Default: 192.168.0.0/16
+    AllowedPattern: "(^$|(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})$)"
+
+  SubnetACidrBlock:
+    Type: String
+    Default: 192.168.0.0/20
+    AllowedPattern: "(^$|(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})$)"
+
+  SubnetBCidrBlock:
+    Type: String
+    Default: 192.168.16.0/20
+    AllowedPattern: "(^$|(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})$)"
+
+  AlbIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: "((\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2}))"
+    Description: "CIDR block allowed for ALB inbound traffic (HTTP/HTTPS)"
+
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: "ACM certificate ARN for HTTPS on ALB. Leave empty for HTTP only."
+
+Conditions:
+  CreateFargateVPC: !Equals [!Ref ExistingVPCId, ""]
+  EnableHTTPS: !Not [!Equals [!Ref CertificateArn, ""]]
+
+Resources:
+  # =============================================================================
+  # VPC (optional - only created when no existing VPC is provided)
+  # =============================================================================
+  DLTVpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateFargateVPC
+    Properties:
+      CidrBlock: !Ref VpcCidrBlock
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  DLTSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: CreateFargateVPC
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Ref SubnetACidrBlock
+      VpcId: !Ref DLTVpc
+      MapPublicIpOnLaunch: true
+
+  DLTSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: CreateFargateVPC
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Ref SubnetBCidrBlock
+      VpcId: !Ref DLTVpc
+      MapPublicIpOnLaunch: true
+
+  DLTIGW:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateFargateVPC
+
+  DLTIGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateFargateVPC
+    Properties:
+      VpcId: !Ref DLTVpc
+      InternetGatewayId: !Ref DLTIGW
+
+  DLTRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateFargateVPC
+    Properties:
+      VpcId: !Ref DLTVpc
+
+  DLTDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateFargateVPC
+    DependsOn: DLTIGWAttachment
+    Properties:
+      RouteTableId: !Ref DLTRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref DLTIGW
+
+  DLTSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateFargateVPC
+    Properties:
+      RouteTableId: !Ref DLTRouteTable
+      SubnetId: !Ref DLTSubnetA
+
+  DLTSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateFargateVPC
+    Properties:
+      RouteTableId: !Ref DLTRouteTable
+      SubnetId: !Ref DLTSubnetB
+
+  # =============================================================================
+  # Storage - Scenarios bucket, History + Scenarios DynamoDB tables
+  # =============================================================================
+  ScenariosBucket:
+    Type: AWS::S3::Bucket
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: [GET, POST, PUT, HEAD]
+            AllowedOrigins: ["*"]
+            ExposedHeaders: [ETag]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  ScenariosBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ScenariosBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt ScenariosBucket.Arn
+              - !Sub "${ScenariosBucket.Arn}/*"
+            Condition:
+              Bool: { aws:SecureTransport: "false" }
+
+  ScenariosTable:
+    Type: AWS::DynamoDB::Table
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: testId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: testId, KeyType: HASH }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+
+  HistoryTable:
+    Type: AWS::DynamoDB::Table
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: testId, AttributeType: S }
+        - { AttributeName: testRunId, AttributeType: S }
+        - { AttributeName: startTime, AttributeType: S }
+      KeySchema:
+        - { AttributeName: testId, KeyType: HASH }
+        - { AttributeName: testRunId, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: testId-startTime-index
+          KeySchema:
+            - { AttributeName: testId, KeyType: HASH }
+            - { AttributeName: startTime, KeyType: RANGE }
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes: [testRunId, endTime, status, results]
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+
+
+  # =============================================================================
+  # Console S3 Bucket (private) - contents served via ALB + Lambda
+  # =============================================================================
+  ConsoleBucket:
+    Type: AWS::S3::Bucket
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # =============================================================================
+  # Web Server: ALB -> Lambda -> S3 (ConsoleBucket)
+  # CN region has no CloudFront for unregistered domains, and S3 static website
+  # hosting is not supported. ALB + Lambda serves static assets from S3.
+  # =============================================================================
+  WebServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt ConsoleBucket.Arn
+                  - !Sub "${ConsoleBucket.Arn}/*"
+
+  WebServerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt WebServerRole.Arn
+      Environment:
+        Variables:
+          CONSOLE_BUCKET: !Ref ConsoleBucket
+          API_URL: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com.cn/prod"
+      Code:
+        ZipFile: |
+          # ALB-invoked Lambda serving static frontend (index.html + config.js) from S3.
+          # In-memory cache keyed by object Key + ETag (30s TTL) keeps S3 GETs small.
+          import os, base64, time, mimetypes
+          import boto3
+          from botocore.exceptions import ClientError
+
+          BUCKET = os.environ['CONSOLE_BUCKET']
+          s3 = boto3.client('s3')
+          _cache = {}  # key -> (expires_at, etag, body_bytes, content_type)
+          TTL = 30
+          DEFAULT_DOC = 'index.html'
+
+          def _alb_resp(status, body, content_type='text/plain; charset=utf-8', extra_headers=None):
+              is_bin = not isinstance(body, str)
+              headers = {
+                  'Content-Type': content_type,
+                  'Cache-Control': 'no-cache,no-store,must-revalidate',
+              }
+              if extra_headers: headers.update(extra_headers)
+              payload = {
+                  'statusCode': status,
+                  'statusDescription': f'{status} OK',
+                  'headers': headers,
+                  'isBase64Encoded': is_bin,
+                  'body': base64.b64encode(body).decode() if is_bin else body,
+              }
+              return payload
+
+          def _guess_ct(key):
+              ct, _ = mimetypes.guess_type(key)
+              if not ct:
+                  return 'application/octet-stream'
+              if ct.startswith('text/') or ct in ('application/javascript', 'application/json', 'image/svg+xml'):
+                  return ct + '; charset=utf-8'
+              return ct
+
+          def _fetch(key):
+              now = time.time()
+              cached = _cache.get(key)
+              if cached and cached[0] > now:
+                  return cached[1], cached[2], cached[3]
+              try:
+                  obj = s3.get_object(Bucket=BUCKET, Key=key)
+              except ClientError as e:
+                  code = e.response.get('Error', {}).get('Code', '')
+                  if code in ('NoSuchKey', 'NotFound', '404'):
+                      return None, None, None
+                  raise
+              body = obj['Body'].read()
+              etag = obj.get('ETag', '').strip('"')
+              ct = _guess_ct(key)
+              _cache[key] = (now + TTL, etag, body, ct)
+              return etag, body, ct
+
+          def handler(event, context):
+              path = event.get('path', '/')
+              method = (event.get('httpMethod') or 'GET').upper()
+              if method not in ('GET', 'HEAD'):
+                  return _alb_resp(405, 'Method Not Allowed')
+
+              # Strip leading slash, default to index.html; serve SPA fallback on miss
+              key = path.lstrip('/') or DEFAULT_DOC
+              if key.endswith('/'):
+                  key += DEFAULT_DOC
+
+              # Dynamic config.js — no manual upload needed
+              if key == 'config.js':
+                  api_url = os.environ.get('API_URL', '')
+                  js = f"window.LTP_CONFIG = {{ API_URL: '{api_url}' }};"
+                  return _alb_resp(200, js, content_type='application/javascript',
+                                   extra_headers={'Cache-Control': 'no-cache,no-store,must-revalidate'})
+
+              try:
+                  etag, body, ct = _fetch(key)
+              except Exception as e:
+                  print(f"fetch {key} failed: {e}")
+                  return _alb_resp(500, f'Internal error: {e}')
+
+              if body is None:
+                  # SPA fallback to index.html for unknown paths (but only for clearly non-asset paths)
+                  if '.' not in key.split('/')[-1]:
+                      try:
+                          etag, body, ct = _fetch(DEFAULT_DOC)
+                      except Exception as e:
+                          return _alb_resp(500, f'Internal error: {e}')
+                  if body is None:
+                      return _alb_resp(404, 'Not Found')
+
+              # HEAD shortcut
+              if method == 'HEAD':
+                  return _alb_resp(200, '', content_type=ct, extra_headers={'ETag': etag or ''})
+
+              # Conditional GET (If-None-Match)
+              headers = event.get('headers') or {}
+              # ALB can deliver single-value (headers) or multi-value (multiValueHeaders)
+              inm = headers.get('if-none-match') or headers.get('If-None-Match') or ''
+              if etag and inm and (inm.strip('"') == etag):
+                  return {
+                      'statusCode': 304, 'statusDescription': '304 Not Modified',
+                      'headers': {'ETag': etag}, 'isBase64Encoded': False, 'body': ''
+                  }
+
+              return _alb_resp(200, body, content_type=ct, extra_headers={'ETag': etag or ''})
+
+  WebServerLambdaAlbPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt WebServerLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: elasticloadbalancing.amazonaws.com
+
+  WebAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Load Testing Pilot Web ALB SG
+      VpcId: !If [CreateFargateVPC, !Ref DLTVpc, !Ref ExistingVPCId]
+      SecurityGroupIngress:
+        - !If
+          - EnableHTTPS
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: !Ref AlbIngressCidr
+            Description: ALB HTTPS inbound
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: !Ref AlbIngressCidr
+            Description: ALB HTTP inbound
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all egress
+
+  WebAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-web"
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - !If [CreateFargateVPC, !Ref DLTSubnetA, !Ref ExistingSubnetA]
+        - !If [CreateFargateVPC, !Ref DLTSubnetB, !Ref ExistingSubnetB]
+      SecurityGroups: [!Ref WebAlbSecurityGroup]
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: WebServerLambdaAlbPermission
+    Properties:
+      Name: !Sub "${AWS::StackName}-web-tg"
+      TargetType: lambda
+      Targets:
+        - Id: !GetAtt WebServerLambda.Arn
+
+  WebListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebAlb
+      Protocol: !If [EnableHTTPS, HTTPS, HTTP]
+      Port: !If [EnableHTTPS, 443, 80]
+      Certificates:
+        !If
+          - EnableHTTPS
+          - - CertificateArn: !Ref CertificateArn
+          - !Ref AWS::NoValue
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  WebHttpRedirectListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: EnableHTTPS
+    Properties:
+      LoadBalancerArn: !Ref WebAlb
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            StatusCode: HTTP_301
+
+  # =============================================================================
+  # Custom Resource Lambda - generates UUID, config files, etc.
+  # (Reused from upstream. Only the UUID and config-file actions are invoked.)
+  # =============================================================================
+  CustomResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ScenariosBucket.Arn
+                  - !Sub "${ScenariosBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt ScenariosTable.Arn
+
+  CustomResourceLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import os, json, uuid, boto3
+          from urllib.request import Request, urlopen
+
+          ddb = boto3.resource('dynamodb')
+          table = ddb.Table(os.environ['DDB_TABLE'])
+          REGION = os.environ['MAIN_REGION']
+
+          def send_response(event, context, status, data=None, reason=''):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f'See CloudWatch Log: {context.log_group_name}/{context.log_stream_name}',
+                  'PhysicalResourceId': event.get('PhysicalResourceId', context.log_stream_name),
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data or {},
+              })
+              req = Request(event['ResponseURL'], data=body.encode(), method='PUT')
+              req.add_header('Content-Type', '')
+              req.add_header('Content-Length', str(len(body)))
+              urlopen(req)
+
+          def handler(event, context):
+              print(json.dumps(event))
+              resource = event.get('ResourceProperties', {}).get('Resource', '')
+              req_type = event.get('RequestType', 'Create')
+
+              try:
+                  if resource == 'UUID':
+                      send_response(event, context, 'SUCCESS', {'UUID': str(uuid.uuid4())})
+
+                  elif resource == 'TestingResourcesConfigFile':
+                      config = event['ResourceProperties'].get('TestingResourcesConfig', {})
+                      region = config.get('region', REGION)
+                      item_id = f'region-{region}'
+
+                      if req_type == 'Delete':
+                          try:
+                              table.delete_item(Key={'testId': item_id})
+                          except Exception as e:
+                              print(f'Delete warning: {e}')
+                      else:
+                          item = {
+                              'testId': item_id,
+                              'region': region,
+                              'subnetA': config.get('subnetA', ''),
+                              'subnetB': config.get('subnetB', ''),
+                              'ecsCloudWatchLogGroup': config.get('ecsCloudWatchLogGroup', ''),
+                              'taskSecurityGroup': config.get('taskSecurityGroup', ''),
+                              'taskDefinition': config.get('taskDefinition', ''),
+                              'taskImage': config.get('taskImage', ''),
+                              'taskCluster': config.get('taskCluster', ''),
+                          }
+                          table.put_item(Item=item)
+                          print(f'Wrote config for {item_id}')
+
+                      send_response(event, context, 'SUCCESS')
+
+                  else:
+                      print(f'Unknown resource: {resource}')
+                      send_response(event, context, 'SUCCESS')
+
+              except Exception as e:
+                  print(f'Error: {e}')
+                  send_response(event, context, 'FAILED', reason=str(e))
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 120
+      Role: !GetAtt CustomResourceRole.Arn
+      Environment:
+        Variables:
+          MAIN_REGION: !Ref AWS::Region
+          S3_BUCKET: !Ref ScenariosBucket
+          DDB_TABLE: !Ref ScenariosTable
+
+  UUIDResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambda.Arn
+      Resource: UUID
+
+  # Writes test-resources-config JSON to S3 AND a DDB item testId=region-<region>
+  # (CustomResource Lambda does both in one call via the TestingResourcesConfigFile action)
+  TestingResourcesConfig:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambda.Arn
+      Resource: TestingResourcesConfigFile
+      TestingResourcesConfig:
+        region: !Ref AWS::Region
+        subnetA: !If [CreateFargateVPC, !Ref DLTSubnetA, !Ref ExistingSubnetA]
+        subnetB: !If [CreateFargateVPC, !Ref DLTSubnetB, !Ref ExistingSubnetB]
+        ecsCloudWatchLogGroup: !Ref EcsLogGroup
+        taskSecurityGroup: !Ref EcsTaskSecurityGroup
+        taskDefinition: !Ref EcsTaskDefinition
+        taskImage: !Sub "${AWS::StackName}-load-tester"
+        taskCluster: !Ref EcsCluster
+
+  # =============================================================================
+  # ECS Cluster, Task Definition, Security Group
+  # =============================================================================
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+      ClusterSettings:
+        - { Name: containerInsights, Value: enabled }
+
+  EcsLogGroup:
+    Type: AWS::Logs::LogGroup
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-load-testing"
+      RetentionInDays: 365
+
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        - PolicyName: task-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ScenariosBucket.Arn
+                  - !Sub "${ScenariosBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:PutMetricFilter
+                  - logs:DeleteMetricFilter
+                Resource: !GetAtt EcsLogGroup.Arn
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+
+  EcsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-load-tester"
+      Cpu: "2048"
+      Memory: "4096"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub "${AWS::StackName}-load-tester"
+          Image: !Ref ContainerImage
+          Essential: true
+          Memory: 4096
+          Environment:
+            - { Name: JVM_ARGS, Value: "-Xms1g -Xmx3g" }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref EcsLogGroup
+              awslogs-stream-prefix: load-testing
+              awslogs-region: !Ref AWS::Region
+
+  EcsTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Load Testing Pilot Fargate Tasks SG
+      VpcId: !If [CreateFargateVPC, !Ref DLTVpc, !Ref ExistingVPCId]
+
+  EcsTaskSGEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref EcsTaskSecurityGroup
+      IpProtocol: "-1"
+      CidrIp: 0.0.0.0/0
+      Description: Allow tasks to reach targets and AWS APIs
+
+  EcsTaskSGIngressSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EcsTaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 50000
+      ToPort: 50000
+      SourceSecurityGroupId: !Ref EcsTaskSecurityGroup
+      Description: Inter-task communication for JMeter RMI
+
+
+
+  # =============================================================================
+  # Results Parser Lambda
+  # =============================================================================
+  ResultsParserRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ScenariosBucket.Arn
+                  - !Sub "${ScenariosBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt ScenariosTable.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt HistoryTable.Arn
+                  - !Sub "${HistoryTable.Arn}/index/*"
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricWidgetImage
+                  - cloudwatch:GetMetricData
+                Resource: "*"
+
+  ResultsParser:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 3072
+      EphemeralStorage:
+        Size: 10240
+      Role: !GetAtt ResultsParserRole.Arn
+      Environment:
+        Variables:
+          SCENARIOS_BUCKET: !Ref ScenariosBucket
+          SCENARIOS_TABLE: !Ref ScenariosTable
+          HISTORY_TABLE: !Ref HistoryTable
+          SOLUTION_ID: SO0062
+          VERSION: v4.0.15
+          UUID: !GetAtt UUIDResource.UUID
+      Code:
+        ZipFile: |
+          # CN region replacement for upstream results-parser.
+          # Upstream calls CloudWatch GetMetricWidgetImage which is heavily rate-limited in
+          # cn-north-1 / cn-northwest-1. The widget image is cosmetic (frontend doesn't render
+          # it), so we skip it entirely here. In addition we parse kpi-*.jtl (per-request JMeter
+          # output) to provide response-code distribution and top failure reasons.
+          import csv, io, json, os, re, shutil
+          from datetime import datetime, timezone
+          from decimal import Decimal
+          from xml.etree import ElementTree as ET
+          import boto3
+
+          SCENARIOS_BUCKET = os.environ['SCENARIOS_BUCKET']
+          SCENARIOS_TABLE  = os.environ['SCENARIOS_TABLE']
+          HISTORY_TABLE    = os.environ['HISTORY_TABLE']
+
+          s3  = boto3.client('s3')
+          ddb = boto3.resource('dynamodb')
+
+          REGION_RE = re.compile(r'[a-z]{1,3}-(?:gov-[a-z]+|[a-z]+)-\d(?=\.(?:xml|jtl)$)')
+
+          def parse_taurus_xml(text):
+              root = ET.fromstring(text)
+              agg = None
+              labels = []
+              # Root-level TestDuration (seconds) is reported once per run; propagate into stats
+              root_duration = None
+              td_el = root.find('TestDuration')
+              if td_el is not None and td_el.text:
+                  try: root_duration = float(td_el.text)
+                  except ValueError: pass
+              # Root-level ECS metadata
+              ecs_duration = None
+              ed_el = root.find('ECSDuration')
+              if ed_el is not None and ed_el.text:
+                  try: ecs_duration = float(ed_el.text)
+                  except ValueError: pass
+              task_cpu = None
+              tc_el = root.find('TaskCPU')
+              if tc_el is not None and tc_el.text:
+                  task_cpu = tc_el.text.strip()
+              task_memory = None
+              tm_el = root.find('TaskMemory')
+              if tm_el is not None and tm_el.text:
+                  task_memory = tm_el.text.strip()
+              for g in root.findall('Group'):
+                  label = g.attrib.get('label', '')
+                  stats = {'rc': []}
+                  for child in g:
+                      if child.tag in ('perc', 'rc'):
+                          continue
+                      v = child.find('value')
+                      if v is not None and v.text is not None:
+                          try: stats[child.tag] = float(v.text)
+                          except ValueError: stats[child.tag] = v.text
+                  for p in g.findall('perc'):
+                      key = 'p' + p.attrib.get('param', '0').replace('.', '_')
+                      v = p.find('value')
+                      if v is not None and v.text is not None:
+                          try: stats[key] = float(v.text)
+                          except ValueError: pass
+                  ACCEPTED = {'200','201','202','204','300','301','302','303','304','307','308','101','1000'}
+                  for rc in g.findall('rc'):
+                      code = rc.attrib.get('param'); val = rc.attrib.get('value')
+                      if code and val and code not in ACCEPTED:
+                          try: stats['rc'].append({'code': code, 'count': int(val)})
+                          except ValueError: pass
+                  # If Group doesn't carry testDuration but root does, inject it
+                  if 'testDuration' not in stats and root_duration is not None:
+                      stats['testDuration'] = root_duration
+                  # Inject ECS metadata into stats
+                  if ecs_duration is not None:
+                      stats['ecsDuration'] = ecs_duration
+                  if task_cpu is not None:
+                      stats['taskCpu'] = task_cpu
+                  if task_memory is not None:
+                      stats['taskMemory'] = task_memory
+                  if label:
+                      stats['label'] = label
+                      labels.append(stats)
+                  else:
+                      agg = stats
+              return {'stats': agg or {}, 'labels': labels}
+
+          def _download_jtl(key):
+              """Download JTL to /tmp. Returns (local_path, is_partial, skip_reason).
+              Partial download uses S3 Range to fetch first N bytes for oversized files."""
+              head = s3.head_object(Bucket=SCENARIOS_BUCKET, Key=key)
+              size = head['ContentLength']
+              fname = '/tmp/' + key.split('/')[-1]
+              free = shutil.disk_usage('/tmp').free - 512*1024*1024  # keep 512MB headroom
+              max_download = min(free, 5*1024*1024*1024)  # cap 5GB per file
+              if size <= max_download:
+                  s3.download_file(SCENARIOS_BUCKET, key, fname)
+                  return fname, False, None
+              if max_download >= 50*1024*1024:  # at least 50MB worth downloading
+                  resp = s3.get_object(Bucket=SCENARIOS_BUCKET, Key=key,
+                                       Range=f'bytes=0-{int(max_download)-1}')
+                  with open(fname, 'wb') as f:
+                      for chunk in resp['Body'].iter_chunks(8*1024*1024):
+                          f.write(chunk)
+                  return fname, True, None
+              return None, False, f'{size/(1024*1024):.0f}MB'
+
+          def parse_jtl_file(fpath):
+              """Parse JTL from local file. Returns (codes, failures, succ, total)."""
+              codes = {}
+              failures = {}
+              total = 0
+              succ = 0
+              with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                  reader = csv.reader(f)
+                  header = next(reader, None)
+                  if not header:
+                      return codes, failures, succ, total
+                  idx = {c: i for i, c in enumerate(header)}
+                  ci_code = idx.get('responseCode')
+                  ci_succ = idx.get('success')
+                  ci_msg  = idx.get('responseMessage')
+                  ci_url  = idx.get('URL')
+                  ci_lbl  = idx.get('label')
+                  ci_elap = idx.get('elapsed')
+                  def _g(row, i):
+                      if i is None or i >= len(row): return ''
+                      return row[i]
+                  for row in reader:
+                      if not row: continue
+                      total += 1
+                      code = (_g(row, ci_code) or 'n/a').strip() or 'n/a'
+                      codes[code] = codes.get(code, 0) + 1
+                      if (_g(row, ci_succ) or '').lower() == 'true':
+                          succ += 1
+                      else:
+                          msg = (_g(row, ci_msg) or '').strip() or 'unknown'
+                          if len(msg) > 240: msg = msg[:237] + '...'
+                          entry = failures.setdefault(msg, {
+                              'count': 0, 'sampleCode': code,
+                              'sampleUrl': '', 'sampleLabel': '', 'sampleElapsed': 0,
+                          })
+                          entry['count'] += 1
+                          if not entry['sampleUrl']:
+                              entry['sampleUrl'] = (_g(row, ci_url) or '').strip()[:500]
+                              entry['sampleLabel'] = (_g(row, ci_lbl) or '').strip()[:200]
+                              try: entry['sampleElapsed'] = int(_g(row, ci_elap) or 0)
+                              except ValueError: pass
+              return codes, failures, succ, total
+
+          def _fmt(val, precision):
+              return f"{float(val):.{precision}f}"
+
+          SUM_FIELDS = {'fail', 'succ', 'throughput'}
+          AVG0_FIELDS = {'bytes', 'concurrency', 'testDuration', 'ecsDuration'}
+          AVG5_FIELDS = {'avg_ct', 'avg_lt', 'avg_rt', 'stdev_rt'}
+          FIRST_FIELDS = {'taskCpu', 'taskMemory'}
+
+          def aggregate(stats_list):
+              if not stats_list: return {}
+              result = {'rc': []}
+              keys = set()
+              for s in stats_list:
+                  for k in s:
+                      if k not in ('rc', 'label'): keys.add(k)
+              for k in keys:
+                  if k in FIRST_FIELDS:
+                      for s in stats_list:
+                          v = s.get(k)
+                          if v is not None:
+                              result[k] = str(v)
+                              break
+                      continue
+                  vals = []
+                  for s in stats_list:
+                      v = s.get(k)
+                      if v is None: continue
+                      try: vals.append(float(v))
+                      except (ValueError, TypeError): pass
+                  if not vals: continue
+                  if k in SUM_FIELDS: result[k] = int(sum(vals))
+                  elif k in AVG0_FIELDS: result[k] = _fmt(sum(vals)/len(vals), 0)
+                  elif k in AVG5_FIELDS: result[k] = _fmt(sum(vals)/len(vals), 5)
+                  else: result[k] = _fmt(sum(vals)/len(vals), 3)
+              merged = {}
+              for s in stats_list:
+                  for rc in s.get('rc', []):
+                      merged[rc['code']] = merged.get(rc['code'], 0) + int(rc.get('count', 0))
+              result['rc'] = [{'code': k, 'count': v} for k, v in merged.items()]
+              return result
+
+          def merge_codes(code_dicts):
+              out = {}
+              for d in code_dicts:
+                  for k, v in d.items(): out[k] = out.get(k, 0) + v
+              return out
+
+          def merge_failures(fail_dicts):
+              out = {}
+              for d in fail_dicts:
+                  for msg, entry in d.items():
+                      if msg in out:
+                          out[msg]['count'] += entry['count']
+                      else:
+                          out[msg] = dict(entry)
+              return out
+
+          def to_ddb(x):
+              if isinstance(x, dict): return {k: to_ddb(v) for k, v in x.items()}
+              if isinstance(x, list): return [to_ddb(v) for v in x]
+              if isinstance(x, float): return Decimal(str(round(x, 6)))
+              if isinstance(x, int) and not isinstance(x, bool): return Decimal(x)
+              return x
+
+          def code_breakdown(codes, total):
+              """Convert raw codes counter to sorted list with percentages."""
+              out = []
+              for code, cnt in sorted(codes.items(), key=lambda x: -x[1]):
+                  pct = (cnt / total * 100) if total > 0 else 0
+                  out.append({'code': code, 'count': cnt, 'percent': _fmt(pct, 2)})
+              return out
+
+          def top_failures(failures, total, limit=10):
+              items = sorted(failures.items(), key=lambda x: -x[1]['count'])[:limit]
+              out = []
+              for msg, e in items:
+                  pct = (e['count'] / total * 100) if total > 0 else 0
+                  out.append({
+                      'message': msg,
+                      'count': e['count'],
+                      'percent': _fmt(pct, 2),
+                      'sampleCode': e.get('sampleCode', ''),
+                      'sampleUrl': e.get('sampleUrl', ''),
+                      'sampleLabel': e.get('sampleLabel', ''),
+                      'sampleElapsed': e.get('sampleElapsed', 0),
+                  })
+              return out
+
+          def handler(event, context):
+              testId = event['testId']
+              prefix = event.get('prefix', '')
+              testRunId = event.get('testRunId', '')
+              print(f"[results-parser-cn] testId={testId} prefix={prefix} runId={testRunId}")
+
+              scenarios_tbl = ddb.Table(SCENARIOS_TABLE)
+              history_tbl   = ddb.Table(HISTORY_TABLE)
+
+              resp = scenarios_tbl.get_item(Key={'testId': testId})
+              scenario = resp.get('Item')
+              if not scenario:
+                  raise Exception(f"testId {testId} not found")
+              if scenario.get('status') in ('cancelling','cancelled','failed'):
+                  return 'skip-terminal'
+
+              startTime = scenario.get('startTime', '')
+              endTime = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+              # List all result files under this run's prefix
+              all_keys = []
+              token = None
+              while True:
+                  kwargs = {'Bucket': SCENARIOS_BUCKET, 'Prefix': f'results/{testId}/{prefix}'}
+                  if token: kwargs['ContinuationToken'] = token
+                  page = s3.list_objects_v2(**kwargs)
+                  all_keys.extend(o['Key'] for o in page.get('Contents', []))
+                  if not page.get('IsTruncated'): break
+                  token = page.get('NextContinuationToken')
+
+              # Group by region
+              xml_by_region = {}
+              jtl_by_region = {}
+              for key in all_keys:
+                  m = REGION_RE.findall(key)
+                  if not m: continue
+                  region = m[-1]
+                  if key.endswith('.xml'):
+                      xml_by_region.setdefault(region, []).append(key)
+                  elif key.endswith('.jtl') and '/kpi-' in key:
+                      jtl_by_region.setdefault(region, []).append(key)
+
+              # Parse XMLs for summary stats
+              parsed_by_region = {}
+              for region, keys in xml_by_region.items():
+                  for key in keys:
+                      try:
+                          body = s3.get_object(Bucket=SCENARIOS_BUCKET, Key=key)['Body'].read()
+                          parsed = parse_taurus_xml(body.decode('utf-8', errors='replace'))
+                          parsed_by_region.setdefault(region, []).append(parsed)
+                      except Exception as e:
+                          print(f"Skipping {key}: {e}")
+
+              # Parse JTLs for per-request detail (download to /tmp for speed)
+              codes_by_region = {}
+              fail_by_region = {}
+              request_total_by_region = {}
+              jtl_warnings = []
+              for region, keys in jtl_by_region.items():
+                  codes_list = []; fail_list = []; req_total = 0
+                  for key in keys:
+                      fname = None
+                      try:
+                          fname, is_partial, skip_reason = _download_jtl(key)
+                          if skip_reason:
+                              jtl_warnings.append(f'JTL file too large ({skip_reason}), skipped response code and error detail analysis')
+                              print(f"Skipping {key}: too large ({skip_reason})")
+                              continue
+                          if is_partial:
+                              jtl_warnings.append('JTL file too large, only partial data analyzed, response code distribution is sampled')
+                          codes, fails, _succ, total = parse_jtl_file(fname)
+                          codes_list.append(codes)
+                          fail_list.append(fails)
+                          req_total += total
+                      except Exception as e:
+                          print(f"Skipping {key}: {e}")
+                      finally:
+                          if fname and os.path.exists(fname):
+                              os.remove(fname)
+                  codes_by_region[region] = merge_codes(codes_list)
+                  fail_by_region[region]  = merge_failures(fail_list)
+                  request_total_by_region[region] = req_total
+
+              if not parsed_by_region:
+                  scenarios_tbl.update_item(
+                      Key={'testId': testId},
+                      UpdateExpression="set #s = :s, #e = :e",
+                      ExpressionAttributeNames={'#s':'status','#e':'errorReason'},
+                      ExpressionAttributeValues={':s':'failed', ':e':'No result files found.'})
+                  return 'failed'
+
+              # Build per-region + total finalResults
+              finalResults = {}
+              completeTasks = {}
+              all_stats = []
+              for region, parsed_list in parsed_by_region.items():
+                  stats_list = [p['stats'] for p in parsed_list if p.get('stats')]
+                  all_stats.extend(stats_list)
+                  completeTasks[region] = len(stats_list)
+                  region_result = aggregate(stats_list)
+                  total = request_total_by_region.get(region, 0)
+                  region_result['responseCodes'] = code_breakdown(codes_by_region.get(region, {}), total)
+                  region_result['topFailures']   = top_failures(fail_by_region.get(region, {}), total)
+                  finalResults[region] = region_result
+
+              total_result = aggregate(all_stats)
+              total_codes = merge_codes(codes_by_region.values())
+              total_failures = merge_failures(fail_by_region.values())
+              total_requests = sum(request_total_by_region.values())
+              total_result['responseCodes'] = code_breakdown(total_codes, total_requests)
+              total_result['topFailures']   = top_failures(total_failures, total_requests)
+              finalResults['total'] = total_result
+              if jtl_warnings:
+                  finalResults['jtlWarnings'] = list(set(jtl_warnings))
+
+              testScenario_raw = scenario.get('testScenario', '{}')
+              try:
+                  testScenario_dict = testScenario_raw if isinstance(testScenario_raw, dict) else json.loads(testScenario_raw)
+              except (ValueError, TypeError):
+                  testScenario_dict = {}
+
+              throughput = float(total_result.get('throughput') or 0)
+              succ = float(total_result.get('succ') or 0)
+              succPercent = _fmt((succ/throughput*100) if throughput>0 else 0, 2)
+
+              history_tbl.put_item(Item={
+                  'testRunId': testRunId, 'testId': testId,
+                  'startTime': startTime, 'endTime': endTime,
+                  'status': 'complete', 'succPercent': succPercent,
+                  'results': to_ddb(finalResults),
+                  'testTaskConfigs': to_ddb(scenario.get('testTaskConfigs', [])),
+                  'testScenario': to_ddb(testScenario_dict),
+                  'testDescription': scenario.get('testDescription',''),
+                  'testType': scenario.get('testType',''),
+                  'completeTasks': to_ddb(completeTasks),
+              })
+              scenarios_tbl.update_item(
+                  Key={'testId': testId},
+                  UpdateExpression='SET #r = :r, #t = :t, #s = :s, #ct = :ct REMOVE awsContext, aiAnalysis',
+                  ExpressionAttributeNames={'#r':'results','#t':'endTime','#s':'status','#ct':'completeTasks'},
+                  ExpressionAttributeValues={':r': to_ddb(finalResults), ':t': endTime,
+                                             ':s':'complete', ':ct': to_ddb(completeTasks)})
+              print(f"[results-parser-cn] testId={testId} done. codes={len(total_codes)} failures={len(total_failures)}")
+              return 'success'
+
+  # =============================================================================
+  # Task Runner Lambda (invoked by Step Functions to start ECS tasks)
+  # =============================================================================
+  TaskRunnerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                  - ecs:TagResource
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt EcsTaskExecutionRole.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt ScenariosTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ScenariosBucket.Arn
+                  - !Sub "${ScenariosBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - logs:PutMetricFilter
+                  - logs:DescribeMetricFilters
+                Resource: "*"
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: { "cloudwatch:namespace": "distributed-load-testing" }
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutDashboard
+                  - cloudwatch:DeleteDashboards
+                Resource: !Sub "arn:${AWS::Partition}:cloudwatch::${AWS::AccountId}:dashboard/EcsLoadTesting*"
+
+  TaskRunner:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import os, json, time, boto3
+          from datetime import datetime, timezone
+
+          ecs = boto3.client('ecs')
+          s3  = boto3.client('s3')
+          ddb = boto3.resource('dynamodb')
+          table = ddb.Table(os.environ['SCENARIOS_TABLE'])
+          BUCKET = os.environ['SCENARIOS_BUCKET']
+          REGION = os.environ['MAIN_STACK_REGION']
+
+          def handler(event, context):
+              """Start ECS Fargate tasks for a load test, write S3 start signal."""
+              tc        = event.get('testTaskConfig', {})
+              test_id   = event.get('testId', '')
+              test_type = event.get('testType', 'simple')
+              file_type = event.get('fileType', 'none')
+              show_live = event.get('showLive', False)
+              duration  = event.get('testDuration', 60)
+              prefix    = event.get('prefix', '')
+              run_id    = event.get('testRunId', '')
+              region    = tc.get('region', REGION)
+              cluster   = tc.get('taskCluster', '')
+              task_def  = tc.get('taskDefinition', '')
+              task_cnt  = int(tc.get('taskCount', 1))
+              subnet_a  = tc.get('subnetA', '')
+              subnet_b  = tc.get('subnetB', '')
+              sg        = tc.get('taskSecurityGroup', '')
+
+              print(f'[task-runner] testId={test_id} region={region} tasks={task_cnt}')
+
+              container_name = task_def.rsplit('/', 1)[-1].split(':')[0] if '/' in task_def else task_def
+              # ECS task def family is the container name
+              # Container name in the task def is {stack}-load-tester
+              # We get it from DescribeTaskDefinition
+              try:
+                  td_resp = ecs.describe_task_definition(taskDefinition=task_def)
+                  containers = td_resp['taskDefinition']['containerDefinitions']
+                  container_name = containers[0]['name'] if containers else container_name
+              except Exception as e:
+                  print(f'  Warning: describe task def failed: {e}')
+
+              env_overrides = [
+                  {'name': 'S3_BUCKET',          'value': BUCKET},
+                  {'name': 'TEST_ID',            'value': test_id},
+                  {'name': 'TEST_RUN_ID',        'value': run_id},
+                  {'name': 'TEST_TYPE',          'value': test_type},
+                  {'name': 'FILE_TYPE',          'value': file_type},
+                  {'name': 'LIVE_DATA_ENABLED',  'value': f'live={show_live}'},
+                  {'name': 'PREFIX',             'value': prefix},
+                  {'name': 'MAIN_STACK_REGION',  'value': REGION},
+              ]
+
+              subnets = [s for s in [subnet_a, subnet_b] if s]
+              launched = 0
+
+              # RunTask in batches of 10 (AWS limit)
+              remaining = task_cnt
+              while remaining > 0:
+                  batch = min(remaining, 10)
+                  try:
+                      resp = ecs.run_task(
+                          cluster=cluster,
+                          taskDefinition=task_def,
+                          count=batch,
+                          launchType='FARGATE',
+                          networkConfiguration={
+                              'awsvpcConfiguration': {
+                                  'subnets': subnets,
+                                  'securityGroups': [sg] if sg else [],
+                                  'assignPublicIp': 'ENABLED',
+                              }
+                          },
+                          overrides={
+                              'containerOverrides': [{
+                                  'name': container_name,
+                                  'environment': env_overrides,
+                              }]
+                          },
+                      )
+                      launched += len(resp.get('tasks', []))
+                      for f in resp.get('failures', []):
+                          print(f'  RunTask failure: {f.get("reason")}')
+                  except Exception as e:
+                      print(f'  RunTask error: {e}')
+                      break
+                  remaining -= batch
+
+              print(f'  Launched {launched}/{task_cnt} tasks')
+
+              # Wait briefly for tasks to register, then write start signal
+              time.sleep(5)
+              try:
+                  s3.put_object(
+                      Bucket=BUCKET,
+                      Key=f'start-signal/{test_id}/{prefix}/{region}/start',
+                      Body=b'',
+                  )
+                  print(f'  Start signal written')
+              except Exception as e:
+                  print(f'  Warning: failed to write start signal: {e}')
+
+              # Update DynamoDB status to running
+              now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+              try:
+                  table.update_item(
+                      Key={'testId': test_id},
+                      UpdateExpression='SET #s = :s, startTime = :t',
+                      ExpressionAttributeNames={'#s': 'status'},
+                      ExpressionAttributeValues={':s': 'running', ':t': now},
+                  )
+              except Exception as e:
+                  print(f'  Warning: DDB update failed: {e}')
+
+              # Must passthrough all input fields + testDuration for Step Functions Wait state
+              # Override pre-flight isRunning=false → true (we just launched tasks)
+              result = {**event, 'testDuration': duration, 'isRunning': True}
+              result.pop('numTasksRunning', None)
+              result.pop('numTasksTotal', None)
+              return result
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 256
+      Role: !GetAtt TaskRunnerRole.Arn
+      Environment:
+        Variables:
+          SCENARIOS_BUCKET: !Ref ScenariosBucket
+          SCENARIOS_TABLE: !Ref ScenariosTable
+          MAIN_STACK_REGION: !Ref AWS::Region
+
+  # =============================================================================
+  # Task Canceler Lambda
+  # =============================================================================
+  TaskCancelerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - ecs:StopTask
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt ScenariosTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:DeleteMetricFilter
+                  - logs:DescribeMetricFilters
+                Resource: "*"
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: { "cloudwatch:namespace": "distributed-load-testing" }
+
+  TaskCanceler:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          ecs = boto3.client('ecs')
+          ddb = boto3.resource('dynamodb')
+          table = ddb.Table(os.environ['SCENARIOS_TABLE'])
+
+          def handler(event, context):
+              """Cancel a running load test: stop ECS tasks, update DynamoDB status."""
+              test_id = event.get('testId', '')
+              tc = event.get('testTaskConfig', {})
+              if isinstance(tc, list):
+                  tc = tc[0] if tc else {}
+              cluster = tc.get('taskCluster', '')
+              print(f'[task-canceler] testId={test_id} cluster={cluster}')
+
+              # Stop all running tasks for this test
+              stopped = 0
+              if cluster:
+                  try:
+                      paginator = ecs.get_paginator('list_tasks')
+                      for page in paginator.paginate(cluster=cluster, desiredStatus='RUNNING'):
+                          task_arns = page.get('taskArns', [])
+                          if not task_arns:
+                              continue
+                          desc = ecs.describe_tasks(cluster=cluster, tasks=task_arns)
+                          for task in desc.get('tasks', []):
+                              # Match by environment variable TEST_ID in container overrides or tags
+                              envs = {}
+                              for c in task.get('containers', []):
+                                  for e in c.get('environment', []):
+                                      envs[e.get('name')] = e.get('value')
+                              # Also check overrides
+                              for co in task.get('overrides', {}).get('containerOverrides', []):
+                                  for e in co.get('environment', []):
+                                      envs[e.get('name')] = e.get('value')
+                              if envs.get('TEST_ID') == test_id:
+                                  arn = task['taskArn']
+                                  print(f'  Stopping task {arn}')
+                                  try:
+                                      ecs.stop_task(cluster=cluster, task=arn, reason='Cancelled by user')
+                                      stopped += 1
+                                  except Exception as e:
+                                      print(f'  Warning: stop_task failed: {e}')
+                  except Exception as e:
+                      print(f'  Error listing tasks: {e}')
+
+              # Update DynamoDB status
+              try:
+                  from datetime import datetime, timezone
+                  table.update_item(
+                      Key={'testId': test_id},
+                      UpdateExpression='SET #s = :s, endTime = :t',
+                      ExpressionAttributeNames={'#s': 'status'},
+                      ExpressionAttributeValues={
+                          ':s': 'cancelled',
+                          ':t': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z'),
+                      },
+                  )
+              except Exception as e:
+                  print(f'  Warning: DDB update failed: {e}')
+
+              print(f'[task-canceler] done, stopped {stopped} tasks')
+              return {'statusCode': 200}
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 300
+      Role: !GetAtt TaskCancelerRole.Arn
+      Environment:
+        Variables:
+          SCENARIOS_TABLE: !Ref ScenariosTable
+
+  # =============================================================================
+  # Task Status Checker Lambda
+  # =============================================================================
+  TaskStatusRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt ScenariosTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource:
+                  - !GetAtt ScenariosBucket.Arn
+                  - !Sub "${ScenariosBucket.Arn}/*"
+
+  TaskStatusChecker:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          ecs = boto3.client('ecs')
+          s3 = boto3.client('s3')
+          SCENARIOS_TABLE = os.environ['SCENARIOS_TABLE']
+          SCENARIOS_BUCKET = os.environ.get('SCENARIOS_BUCKET', '')
+
+          def handler(event, context):
+              """Check if ECS load-test tasks are still running.
+              Returns isRunning + passthrough of all input fields for Step Functions."""
+              tc = event.get('testTaskConfig', {})
+              test_id = event.get('testId', '')
+              prefix = event.get('prefix', '')
+              region = tc.get('region', os.environ.get('AWS_REGION', ''))
+              cluster = tc.get('taskCluster', '')
+              task_count = int(tc.get('taskCount', 1))
+
+              print(f'[task-status-checker] testId={test_id} cluster={cluster} expected={task_count}')
+
+              running = 0
+              total = 0
+
+              # Strategy 1: check S3 completion markers
+              if SCENARIOS_BUCKET and prefix:
+                  try:
+                      resp = s3.list_objects_v2(
+                          Bucket=SCENARIOS_BUCKET,
+                          Prefix=f'results/{test_id}/{prefix}/completion/{region}/',
+                      )
+                      completed = resp.get('KeyCount', 0)
+                      print(f'  Completion markers: {completed}/{task_count}')
+                      if completed >= task_count:
+                          result = {**event, 'isRunning': False, 'numTasksRunning': 0, 'numTasksTotal': task_count}
+                          return result
+                  except Exception as e:
+                      print(f'  S3 check failed, falling back to ECS: {e}')
+
+              # Strategy 2: check ECS task status
+              if cluster:
+                  try:
+                      for status in ['RUNNING', 'PENDING', 'STOPPED']:
+                          paginator = ecs.get_paginator('list_tasks')
+                          for page in paginator.paginate(cluster=cluster, desiredStatus=status if status != 'STOPPED' else 'STOPPED'):
+                              arns = page.get('taskArns', [])
+                              if not arns:
+                                  continue
+                              desc = ecs.describe_tasks(cluster=cluster, tasks=arns)
+                              for task in desc.get('tasks', []):
+                                  envs = {}
+                                  for co in task.get('overrides', {}).get('containerOverrides', []):
+                                      for e in co.get('environment', []):
+                                          envs[e.get('name')] = e.get('value')
+                                  if envs.get('TEST_ID') != test_id:
+                                      continue
+                                  total += 1
+                                  if task.get('lastStatus') == 'RUNNING':
+                                      running += 1
+                  except Exception as e:
+                      print(f'  ECS check error: {e}')
+
+              # running > 0 → tasks still executing
+              # total == 0 AND tasks were already launched → still provisioning
+              # total == 0 AND pre-flight check (no tasks launched yet) → NOT running
+              # We distinguish via: if no tasks match our TEST_ID, the test isn't running.
+              is_running = running > 0
+              print(f'  running={running} total={total} is_running={is_running}')
+
+              result = {
+                  **event,
+                  'isRunning': is_running,
+                  'numTasksRunning': running,
+                  'numTasksTotal': task_count,
+              }
+              return result
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 180
+      Role: !GetAtt TaskStatusRole.Arn
+      Environment:
+        Variables:
+          SCENARIOS_TABLE: !Ref ScenariosTable
+          SCENARIOS_BUCKET: !Ref ScenariosBucket
+
+  # =============================================================================
+  # Metric Filter Cleaner Lambda
+  # =============================================================================
+  MetricFilterCleanerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - logs:DeleteMetricFilter
+                  - logs:DescribeMetricFilters
+                Resource: "*"
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: { "cloudwatch:namespace": "distributed-load-testing" }
+
+  MetricFilterCleaner:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          logs = boto3.client('logs')
+          LOG_GROUP = os.environ['ECS_LOG_GROUP']
+
+          def handler(event, context):
+              """Clean up CloudWatch metric filters created during a load test."""
+              test_id = event.get('testId', '')
+              print(f'[metric-filter-cleaner] testId={test_id}')
+              try:
+                  paginator = logs.get_paginator('describe_metric_filters')
+                  for page in paginator.paginate(logGroupName=LOG_GROUP):
+                      for mf in page.get('metricFilters', []):
+                          name = mf.get('filterName', '')
+                          if test_id and test_id in name:
+                              print(f'  Deleting metric filter: {name}')
+                              try:
+                                  logs.delete_metric_filter(logGroupName=LOG_GROUP, filterName=name)
+                              except Exception as e:
+                                  print(f'  Warning: failed to delete {name}: {e}')
+              except logs.exceptions.ResourceNotFoundException:
+                  print(f'  Log group {LOG_GROUP} not found, skipping')
+              except Exception as e:
+                  print(f'  Error describing metric filters: {e}')
+              return {'statusCode': 200}
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 180
+      Role: !GetAtt MetricFilterCleanerRole.Arn
+      Environment:
+        Variables:
+          ECS_LOG_GROUP: !Ref EcsLogGroup
+
+  # =============================================================================
+  # AwsContext Lambda — on-demand lookup of ELB / TargetGroup / EC2 / CloudWatch
+  # =============================================================================
+  AwsContextRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - elasticloadbalancing:DescribeListeners
+                  - ec2:DescribeInstances
+                  - ec2:DescribeNetworkInterfaces
+                  - cloudwatch:GetMetricData
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: "*"
+
+  AwsContext:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 512
+      Role: !GetAtt AwsContextRole.Arn
+      Environment:
+        Variables:
+          OWN_ROLE_ARN: !GetAtt AwsContextRole.Arn
+      Code:
+        ZipFile: |
+          # Resolve a load-test target (hostname or IP) to AWS infrastructure and pull
+          # CloudWatch metrics for the ELB / target group / backend instances during a
+          # given time window. Returns a single JSON doc consumed by the frontend
+          # 'AWS Resources & Metrics' card and later fed to the AI analysis endpoint.
+          import json, os, re, ipaddress, socket
+          from datetime import datetime, timezone, timedelta
+          import boto3
+          from botocore.exceptions import ClientError
+
+          elbv2 = boto3.client('elbv2')
+          ec2   = boto3.client('ec2')
+          cw    = boto3.client('cloudwatch')
+
+          def _resp(code, body):
+              return {
+                  'statusCode': code,
+                  'headers': {
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Api-Key',
+                      'Content-Type': 'application/json'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+
+          VALID_REGIONS = {'cn-north-1', 'cn-northwest-1'}
+
+          def _make_clients(cred_config, region=None):
+              rk = {}
+              if region and region in VALID_REGIONS:
+                  rk['region_name'] = region
+              if not cred_config or not cred_config.get('mode'):
+                  if rk:
+                      s = boto3.Session(**rk)
+                      return (s.client('elbv2'), s.client('ec2'), s.client('cloudwatch'))
+                  return elbv2, ec2, cw
+              mode = cred_config['mode']
+              kw = {}
+              if mode == 'aksk':
+                  kw = dict(aws_access_key_id=cred_config['accessKeyId'],
+                            aws_secret_access_key=cred_config['secretAccessKey'])
+              elif mode == 'temp':
+                  kw = dict(aws_access_key_id=cred_config['accessKeyId'],
+                            aws_secret_access_key=cred_config['secretAccessKey'],
+                            aws_session_token=cred_config['sessionToken'])
+              elif mode == 'role':
+                  sts = boto3.client('sts')
+                  resp = sts.assume_role(RoleArn=cred_config['roleArn'],
+                                         RoleSessionName='load-testing-pilot-cross-acct',
+                                         DurationSeconds=900)
+                  c = resp['Credentials']
+                  kw = dict(aws_access_key_id=c['AccessKeyId'],
+                            aws_secret_access_key=c['SecretAccessKey'],
+                            aws_session_token=c['SessionToken'])
+              else:
+                  if rk:
+                      s = boto3.Session(**rk)
+                      return (s.client('elbv2'), s.client('ec2'), s.client('cloudwatch'))
+                  return elbv2, ec2, cw
+              kw.update(rk)
+              s = boto3.Session(**kw)
+              return (s.client('elbv2'), s.client('ec2'), s.client('cloudwatch'))
+
+          def _is_ip(s):
+              try:
+                  ipaddress.ip_address(s)
+                  return True
+              except ValueError:
+                  return False
+
+          def _hostname_from_target(target):
+              t = (target or '').strip()
+              # Strip scheme + path + port
+              t = re.sub(r'^\w+://', '', t)
+              t = t.split('/', 1)[0]
+              t = t.split(':', 1)[0]
+              return t.lower()
+
+          def find_elb_by_hostname(hostname):
+              """Match ALB/NLB where DNSName equals / is a prefix of hostname, or where a custom domain CNAMEs to it."""
+              target_dns = hostname
+              # If user entered their own domain, resolve CNAME chain to find the *.elb.amazonaws.com.cn name
+              try:
+                  resolved = socket.gethostbyname_ex(hostname)  # (canonical, aliases, addresses)
+                  canonical = resolved[0].lower()
+                  if 'elb.amazonaws.com' in canonical:
+                      target_dns = canonical
+              except Exception:
+                  pass
+
+              lbs = []
+              paginator = elbv2.get_paginator('describe_load_balancers')
+              for page in paginator.paginate():
+                  lbs.extend(page['LoadBalancers'])
+              for lb in lbs:
+                  dns = (lb.get('DNSName') or '').lower()
+                  if dns == target_dns or target_dns.endswith('.' + dns):
+                      return lb
+              return None
+
+          def list_target_groups_for_lb(lb_arn):
+              tgs = []
+              paginator = elbv2.get_paginator('describe_target_groups')
+              for page in paginator.paginate(LoadBalancerArn=lb_arn):
+                  tgs.extend(page['TargetGroups'])
+              return tgs
+
+          def list_target_health(tg_arn):
+              resp = elbv2.describe_target_health(TargetGroupArn=tg_arn)
+              return resp.get('TargetHealthDescriptions', [])
+
+          def instance_ids_from_targets(targets, vpc_id):
+              """Given target list (may be InstanceId or IP), return list of InstanceIds."""
+              ids = set()
+              ips = []
+              for t in targets:
+                  tid = t.get('Target', {}).get('Id', '')
+                  if tid.startswith('i-'):
+                      ids.add(tid)
+                  elif _is_ip(tid):
+                      ips.append(tid)
+              if ips:
+                  # Look up ENIs in the VPC that own these private IPs → find the attached instance
+                  filters = [{'Name': 'addresses.private-ip-address', 'Values': ips}]
+                  if vpc_id:
+                      filters.append({'Name': 'vpc-id', 'Values': [vpc_id]})
+                  try:
+                      enis = ec2.describe_network_interfaces(Filters=filters).get('NetworkInterfaces', [])
+                      for eni in enis:
+                          att = eni.get('Attachment', {})
+                          iid = att.get('InstanceId')
+                          if iid: ids.add(iid)
+                  except ClientError as e:
+                      print(f"describe_network_interfaces failed: {e}")
+              return sorted(ids)
+
+          def describe_instances(ids):
+              if not ids: return []
+              out = []
+              resp = ec2.describe_instances(InstanceIds=ids)
+              for r in resp.get('Reservations', []):
+                  for ins in r.get('Instances', []):
+                      name = ''
+                      for tag in ins.get('Tags', []):
+                          if tag['Key'] == 'Name':
+                              name = tag['Value']; break
+                      # Collect attached EBS volume IDs
+                      volumes = []
+                      for bdm in ins.get('BlockDeviceMappings', []):
+                          ebs = bdm.get('Ebs', {})
+                          vid = ebs.get('VolumeId')
+                          if vid:
+                              volumes.append({'volumeId': vid, 'device': bdm.get('DeviceName', '')})
+                      out.append({
+                          'instanceId': ins['InstanceId'],
+                          'name': name,
+                          'instanceType': ins.get('InstanceType'),
+                          'privateIp': ins.get('PrivateIpAddress'),
+                          'state': ins.get('State', {}).get('Name'),
+                          'az': ins.get('Placement', {}).get('AvailabilityZone'),
+                          'volumes': volumes,
+                      })
+              return out
+
+          # --- Metric catalog ---------------------------------------------------------
+          ALB_METRICS = [
+              ('RequestCount', 'Sum'),
+              ('TargetResponseTime', 'Average'),
+              ('HTTPCode_Target_2XX_Count', 'Sum'),
+              ('HTTPCode_Target_4XX_Count', 'Sum'),
+              ('HTTPCode_Target_5XX_Count', 'Sum'),
+              ('HTTPCode_ELB_5XX_Count', 'Sum'),
+              ('HTTPCode_ELB_4XX_Count', 'Sum'),
+              ('ActiveConnectionCount', 'Average'),
+              ('NewConnectionCount', 'Sum'),
+              ('RejectedConnectionCount', 'Sum'),
+              ('ConsumedLCUs', 'Sum'),
+              ('TargetConnectionErrorCount', 'Sum'),
+              ('ProcessedBytes', 'Sum'),
+          ]
+          NLB_METRICS = [
+              ('ActiveFlowCount', 'Average'),
+              ('NewFlowCount', 'Sum'),
+              ('ProcessedBytes', 'Sum'),
+              ('TCP_Target_Reset_Count', 'Sum'),
+              ('TCP_ELB_Reset_Count', 'Sum'),
+          ]
+          CLB_METRICS = [
+              ('RequestCount', 'Sum'),
+              ('Latency', 'Average'),
+              ('HTTPCode_Backend_2XX', 'Sum'),
+              ('HTTPCode_Backend_4XX', 'Sum'),
+              ('HTTPCode_Backend_5XX', 'Sum'),
+              ('HTTPCode_ELB_5XX', 'Sum'),
+              ('SurgeQueueLength', 'Maximum'),
+              ('SpilloverCount', 'Sum'),
+          ]
+          EC2_METRICS = [
+              ('CPUUtilization', 'Average'),
+              ('NetworkIn', 'Sum'),
+              ('NetworkOut', 'Sum'),
+              ('NetworkPacketsIn', 'Sum'),
+              ('NetworkPacketsOut', 'Sum'),
+              ('DiskReadOps', 'Sum'),
+              ('DiskWriteOps', 'Sum'),
+              ('StatusCheckFailed', 'Maximum'),
+              ('CPUCreditBalance', 'Minimum'),
+          ]
+          EBS_METRICS = [
+              ('VolumeReadOps', 'Sum'),
+              ('VolumeWriteOps', 'Sum'),
+              ('VolumeQueueLength', 'Average'),
+              ('VolumeReadBytes', 'Sum'),
+              ('VolumeWriteBytes', 'Sum'),
+              ('VolumeTotalReadTime', 'Average'),
+              ('VolumeTotalWriteTime', 'Average'),
+              ('BurstBalance', 'Minimum'),
+          ]
+          TG_METRICS = [
+              ('HealthyHostCount', 'Minimum'),
+              ('UnHealthyHostCount', 'Maximum'),
+              ('RequestCountPerTarget', 'Sum'),
+              ('TargetResponseTime', 'Average'),
+          ]
+
+          def pick_period(start, end):
+              span = (end - start).total_seconds()
+              if span <= 3600:    return 60
+              if span <= 6*3600:  return 300
+              if span <= 86400:   return 900
+              return 3600
+
+          def get_metrics(namespace, dimensions, metrics, start, end):
+              """Pull multiple metrics in ONE GetMetricData call. Returns dict{metricName: {timestamps, values, stat, unit}}."""
+              if not metrics: return {}
+              period = pick_period(start, end)
+              queries = []
+              for idx, (name, stat) in enumerate(metrics):
+                  queries.append({
+                      'Id': f'm{idx}',
+                      'MetricStat': {
+                          'Metric': {
+                              'Namespace': namespace,
+                              'MetricName': name,
+                              'Dimensions': dimensions,
+                          },
+                          'Period': period,
+                          'Stat': stat,
+                      },
+                      'ReturnData': True,
+                  })
+              try:
+                  resp = cw.get_metric_data(
+                      MetricDataQueries=queries,
+                      StartTime=start, EndTime=end,
+                      ScanBy='TimestampAscending',
+                  )
+              except ClientError as e:
+                  print(f"GetMetricData failed ns={namespace}: {e}")
+                  return {}
+              out = {}
+              for i, (name, stat) in enumerate(metrics):
+                  r = resp['MetricDataResults'][i]
+                  tstamps = [t.isoformat() for t in r.get('Timestamps', [])]
+                  values  = [float(v) for v in r.get('Values', [])]
+                  out[name] = {
+                      'stat': stat,
+                      'period': period,
+                      'timestamps': tstamps,
+                      'values': values,
+                      'sum': sum(values) if values else 0,
+                      'max': max(values) if values else 0,
+                      'min': min(values) if values else 0,
+                      'avg': (sum(values)/len(values)) if values else 0,
+                  }
+              return out
+
+          # Map LB type → namespace + metric set
+          def lb_ns_and_metrics(lb):
+              t = (lb.get('Type') or 'application').lower()
+              if t == 'network':
+                  return 'AWS/NetworkELB', NLB_METRICS
+              if t == 'gateway':
+                  return 'AWS/GatewayELB', []
+              return 'AWS/ApplicationELB', ALB_METRICS
+
+          def lb_dimension_value(lb):
+              """CloudWatch LoadBalancer dim uses 'app/<name>/<id>' format (drop 'arn:...loadbalancer/')."""
+              arn = lb['LoadBalancerArn']
+              # e.g. arn:aws-cn:elasticloadbalancing:cn-north-1:xxx:loadbalancer/app/my-alb/abcd1234
+              return arn.split(':loadbalancer/')[-1]
+
+          def tg_dimension_value(tg_arn):
+              # e.g. targetgroup/my-tg/xxxx
+              return tg_arn.split(':')[-1]
+
+          def handler(event, context):
+              try:
+                  # Support POST body (preferred) with GET query-string fallback
+                  body = {}
+                  raw = event.get('body')
+                  if raw:
+                      try: body = json.loads(raw)
+                      except: pass
+                  qp = event.get('queryStringParameters') or {}
+                  target = (body.get('target') or qp.get('target', '')).strip()
+                  st = body.get('startTime') or qp.get('startTime')
+                  et = body.get('endTime') or qp.get('endTime')
+                  cred_config = body.get('credentials')
+                  region = body.get('region') or qp.get('region')
+                  if region and region not in VALID_REGIONS:
+                      return _resp(400, {'error': f'Invalid region: {region}'})
+                  if not target:
+                      return _resp(400, {'error': 'Missing target parameter'})
+                  if not st or not et:
+                      return _resp(400, {'error': 'Missing startTime/endTime'})
+                  start = datetime.fromisoformat(st.replace('Z', '+00:00')).astimezone(timezone.utc)
+                  end   = datetime.fromisoformat(et.replace('Z', '+00:00')).astimezone(timezone.utc)
+                  start = start - timedelta(minutes=1)
+                  end   = end + timedelta(minutes=1)
+
+                  # Swap global clients if credentials or target region provided
+                  global elbv2, ec2, cw
+                  _orig = (elbv2, ec2, cw)
+                  try:
+                      elbv2, ec2, cw = _make_clients(cred_config, region)
+                  except Exception as e:
+                      return _resp(400, {'error': f'Credential error: {e}'})
+
+                  host = _hostname_from_target(target)
+                  direct_ip = _is_ip(host)
+
+                  result = {
+                      'target': target,
+                      'host': host,
+                      'isIp': direct_ip,
+                      'window': { 'start': start.isoformat(), 'end': end.isoformat() },
+                      'elb': None,
+                      'targetGroups': [],
+                      'instances': [],
+                      'lambdaRoleArn': os.environ.get('OWN_ROLE_ARN', ''),
+                  }
+
+                  lb = None
+                  if not direct_ip:
+                      lb = find_elb_by_hostname(host)
+
+                  if lb:
+                      ns, lb_metrics = lb_ns_and_metrics(lb)
+                      lb_dim_value = lb_dimension_value(lb)
+                      lb_metric_data = get_metrics(
+                          ns,
+                          [{'Name': 'LoadBalancer', 'Value': lb_dim_value}],
+                          lb_metrics, start, end,
+                      )
+                      result['elb'] = {
+                          'arn': lb['LoadBalancerArn'],
+                          'name': lb['LoadBalancerName'],
+                          'type': lb.get('Type'),
+                          'scheme': lb.get('Scheme'),
+                          'dnsName': lb.get('DNSName'),
+                          'vpcId': lb.get('VpcId'),
+                          'azs': [z.get('ZoneName') for z in lb.get('AvailabilityZones', [])],
+                          'metrics': lb_metric_data,
+                      }
+                      # Target groups
+                      all_instance_ids = set()
+                      tgs_info = []
+                      for tg in list_target_groups_for_lb(lb['LoadBalancerArn']):
+                          health = list_target_health(tg['TargetGroupArn'])
+                          tg_dim_val = tg_dimension_value(tg['TargetGroupArn'])
+                          tg_metric_data = get_metrics(
+                              ns,
+                              [
+                                  {'Name': 'TargetGroup', 'Value': tg_dim_val},
+                                  {'Name': 'LoadBalancer', 'Value': lb_dim_value},
+                              ],
+                              TG_METRICS, start, end,
+                          )
+                          ids = instance_ids_from_targets(health, lb.get('VpcId'))
+                          all_instance_ids.update(ids)
+                          tgs_info.append({
+                              'arn': tg['TargetGroupArn'],
+                              'name': tg['TargetGroupName'],
+                              'protocol': tg.get('Protocol'),
+                              'port': tg.get('Port'),
+                              'targetType': tg.get('TargetType'),
+                              'targets': [
+                                  {
+                                      'id': h['Target']['Id'],
+                                      'port': h['Target'].get('Port'),
+                                      'state': h['TargetHealth'].get('State'),
+                                      'reason': h['TargetHealth'].get('Reason'),
+                                      'description': h['TargetHealth'].get('Description'),
+                                  }
+                                  for h in health
+                              ],
+                              'resolvedInstanceIds': ids,
+                              'metrics': tg_metric_data,
+                          })
+                      result['targetGroups'] = tgs_info
+                      instances = describe_instances(list(all_instance_ids))
+                      for inst in instances:
+                          inst['metrics'] = get_metrics(
+                              'AWS/EC2',
+                              [{'Name': 'InstanceId', 'Value': inst['instanceId']}],
+                              EC2_METRICS, start, end,
+                          )
+                          # EBS metrics per volume
+                          inst['ebsMetrics'] = {}
+                          for vol in inst.get('volumes', []):
+                              vol_metrics = get_metrics(
+                                  'AWS/EBS',
+                                  [{'Name': 'VolumeId', 'Value': vol['volumeId']}],
+                                  EBS_METRICS, start, end,
+                              )
+                              inst['ebsMetrics'][vol['volumeId']] = vol_metrics
+                      result['instances'] = instances
+                  elif direct_ip:
+                      # IP direct target: try to find an ENI with this IP and resolve the instance
+                      try:
+                          enis = ec2.describe_network_interfaces(
+                              Filters=[{'Name': 'addresses.private-ip-address', 'Values': [host]}]
+                          ).get('NetworkInterfaces', [])
+                          iids = set()
+                          for eni in enis:
+                              att = eni.get('Attachment', {})
+                              if att.get('InstanceId'): iids.add(att['InstanceId'])
+                          instances = describe_instances(list(iids))
+                          for inst in instances:
+                              inst['metrics'] = get_metrics(
+                                  'AWS/EC2',
+                                  [{'Name': 'InstanceId', 'Value': inst['instanceId']}],
+                                  EC2_METRICS, start, end,
+                              )
+                              inst['ebsMetrics'] = {}
+                              for vol in inst.get('volumes', []):
+                                  vol_metrics = get_metrics(
+                                      'AWS/EBS',
+                                      [{'Name': 'VolumeId', 'Value': vol['volumeId']}],
+                                      EBS_METRICS, start, end,
+                                  )
+                                  inst['ebsMetrics'][vol['volumeId']] = vol_metrics
+                          result['instances'] = instances
+                      except ClientError as e:
+                          print(f"IP lookup failed: {e}")
+
+                  elbv2, ec2, cw = _orig
+                  return _resp(200, result)
+              except Exception as e:
+                  elbv2, ec2, cw = _orig
+                  print(f"AwsContext error: {e}")
+                  import traceback; traceback.print_exc()
+                  return _resp(500, {'error': str(e)})
+
+  # =============================================================================
+  # AiProxy Lambda — forwards chat completions to an OpenAI-compatible endpoint
+  # The frontend stores API key/base URL in localStorage and sends per-request.
+  # =============================================================================
+  AiProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+
+  AiProxy:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Timeout: 900
+      MemorySize: 256
+      Role: !GetAtt AiProxyRole.Arn
+      Code:
+        ZipFile: |
+          // Node.js proxy to an OpenAI-compatible /chat/completions endpoint.
+          // - When invoked via API Gateway (sync, 29s max), returns a one-shot JSON response.
+          // - When invoked via Lambda Function URL with RESPONSE_STREAM, streams deltas back
+          //   to the browser so the UI can render token-by-token within the 15-minute budget.
+          // The frontend passes baseUrl / apiKey / model / messages per request.
+
+          'use strict';
+
+          const STATIC_CORS = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST,OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Api-Key',
+          };
+
+          function buildUrl(baseUrl) {
+              let u = (baseUrl || '').replace(/\/+$/, '');
+              if (u.endsWith('/chat/completions')) return u;
+              if (u.endsWith('/v1')) return u + '/chat/completions';
+              return u + '/v1/chat/completions';
+          }
+
+          function validate(body) {
+              const base = (body.baseUrl || '').trim();
+              const key = (body.apiKey || '').trim();
+              const model = (body.model || '').trim();
+              const msgs = body.messages || [];
+              if (!base || !key || !model || !msgs.length) {
+                  return 'baseUrl / apiKey / model / messages required';
+              }
+              return null;
+          }
+
+          // ===== Non-streaming handler (API Gateway / direct invoke) =====
+          async function nonStreaming(event) {
+              const raw = event.body || '{}';
+              let body;
+              try { body = JSON.parse(raw); } catch {
+                  return { statusCode: 400, headers: { 'Content-Type': 'application/json', ...STATIC_CORS },
+                           body: JSON.stringify({ error: 'invalid json' }) };
+              }
+              const err = validate(body);
+              if (err) return { statusCode: 400, headers: { 'Content-Type':'application/json', ...STATIC_CORS }, body: JSON.stringify({ error: err }) };
+
+              const url = buildUrl(body.baseUrl);
+              let upstream;
+              try {
+                  upstream = await fetch(url, {
+                      method: 'POST',
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Authorization': `Bearer ${body.apiKey}`,
+                      },
+                      body: JSON.stringify({
+                          model: body.model,
+                          messages: body.messages,
+                          temperature: body.temperature ?? 0.2,
+                          stream: false,
+                      }),
+                  });
+              } catch (e) {
+                  return { statusCode: 502, headers: { 'Content-Type':'application/json', ...STATIC_CORS },
+                           body: JSON.stringify({ error: `upstream unreachable: ${e.message}` }) };
+              }
+              const text = await upstream.text();
+              if (!upstream.ok) {
+                  return { statusCode: upstream.status, headers: { 'Content-Type':'application/json', ...STATIC_CORS },
+                           body: JSON.stringify({ error: `upstream ${upstream.status}`, detail: text.slice(0, 4000) }) };
+              }
+              let data;
+              try { data = JSON.parse(text); } catch {
+                  return { statusCode: 502, headers: { 'Content-Type':'application/json', ...STATIC_CORS },
+                           body: JSON.stringify({ error: 'non-json response', raw: text.slice(0, 2000) }) };
+              }
+              const content = data.choices?.[0]?.message?.content || '';
+              return {
+                  statusCode: 200,
+                  headers: { 'Content-Type':'application/json', ...STATIC_CORS },
+                  body: JSON.stringify({ content, model: data.model || body.model, usage: data.usage || {} }),
+              };
+          }
+
+          exports.handler = nonStreaming;
+
+  # AiProxy is invoked as a synchronous fallback via API Gateway. Modern LLM
+  # endpoints (DeepSeek / DashScope / OpenAI / Moonshot) support CORS so the
+  # browser can call them directly and stream tokens without any server-side
+  # proxy at all. We only keep this for providers that don't set CORS headers.
+
+  # =============================================================================
+  # UploadUrl Lambda — generates S3 presigned PUT URLs for script file uploads
+  # =============================================================================
+  UploadUrlRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub "${ScenariosBucket.Arn}/test-scenarios/*"
+                  - !Sub "${ScenariosBucket.Arn}/public/test-scenarios/*"
+
+  UploadUrl:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 10
+      MemorySize: 128
+      Role: !GetAtt UploadUrlRole.Arn
+      Environment:
+        Variables:
+          SCENARIOS_BUCKET: !Ref ScenariosBucket
+      Code:
+        ZipFile: |
+          import json, os, re
+          import boto3
+
+          s3 = boto3.client('s3')
+          BUCKET = os.environ['SCENARIOS_BUCKET']
+          ALLOWED_EXT = {'.jmx', '.js', '.py', '.zip', '.yml', '.yaml'}
+          CORS = {
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Methods': 'GET,OPTIONS',
+              'Access-Control-Allow-Headers': 'Content-Type,X-Api-Key',
+          }
+
+          def handler(event, context):
+              params = event.get('queryStringParameters') or {}
+              test_id = (params.get('testId') or '').strip()
+              file_ext = (params.get('fileExt') or '').strip().lower()
+              test_type = (params.get('testType') or '').strip().lower()
+              action = (params.get('action') or '').strip().lower()
+              if not file_ext.startswith('.'):
+                  file_ext = '.' + file_ext
+
+              if not test_id or not re.match(r'^[a-zA-Z0-9-]+$', test_id):
+                  return {'statusCode': 400, 'headers': CORS,
+                          'body': json.dumps({'error': 'invalid testId'})}
+              if file_ext not in ALLOWED_EXT:
+                  return {'statusCode': 400, 'headers': CORS,
+                          'body': json.dumps({'error': f'unsupported extension: {file_ext}'})}
+
+              # Path must match container download: public/test-scenarios/{type}/{id}.{ext}
+              if test_type in ('jmeter', 'k6', 'locust'):
+                  key = f'public/test-scenarios/{test_type}/{test_id}{file_ext}'
+              else:
+                  key = f'public/test-scenarios/script/{test_id}{file_ext}'
+
+              if action == 'download':
+                  url = s3.generate_presigned_url(
+                      'get_object',
+                      Params={'Bucket': BUCKET, 'Key': key},
+                      ExpiresIn=3600,
+                  )
+                  return {
+                      'statusCode': 200,
+                      'headers': {**CORS, 'Content-Type': 'application/json'},
+                      'body': json.dumps({'downloadUrl': url, 'key': key}),
+                  }
+
+              url = s3.generate_presigned_url(
+                  'put_object',
+                  Params={'Bucket': BUCKET, 'Key': key},
+                  ExpiresIn=300,
+                  HttpMethod='PUT',
+              )
+              return {
+                  'statusCode': 200,
+                  'headers': {**CORS, 'Content-Type': 'application/json'},
+                  'body': json.dumps({'uploadUrl': url, 'key': key}),
+              }
+
+  # =============================================================================
+  # Step Functions State Machine
+  # =============================================================================
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: !Sub "states.${AWS::Region}.amazonaws.com" }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt TaskRunner.Arn
+                  - !GetAtt TaskStatusChecker.Arn
+                  - !GetAtt TaskCanceler.Arn
+                  - !GetAtt ResultsParser.Arn
+                  - !GetAtt MetricFilterCleaner.Arn
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString: !Sub |
+        {
+          "StartAt": "Regions for testing",
+          "States": {
+            "Regions for testing": {
+              "Type": "Map",
+              "ResultPath": null,
+              "Next": "Parse result",
+              "InputPath": "$",
+              "ItemsPath": "$.testTaskConfig",
+              "ItemSelector": {
+                "testTaskConfig.$": "$$.Map.Item.Value",
+                "testId.$": "$.testId",
+                "testType.$": "$.testType",
+                "fileType.$": "$.fileType",
+                "showLive.$": "$.showLive",
+                "testDuration.$": "$.testDuration",
+                "prefix.$": "$.prefix",
+                "testRunId.$": "$.testRunId"
+              },
+              "ItemProcessor": {
+                "ProcessorConfig": { "Mode": "INLINE" },
+                "StartAt": "Check running tests",
+                "States": {
+                  "Check running tests": {
+                    "Type": "Task",
+                    "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+                    "InputPath": "$",
+                    "OutputPath": "$.Payload",
+                    "Parameters": {
+                      "FunctionName": "${TaskStatusChecker.Arn}",
+                      "Payload.$": "$"
+                    },
+                    "Retry": [{
+                      "ErrorEquals": ["Lambda.ClientExecutionTimeoutException","Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException"],
+                      "IntervalSeconds": 2, "MaxAttempts": 6, "BackoffRate": 2
+                    }],
+                    "Next": "No running tests"
+                  },
+                  "No running tests": {
+                    "Type": "Choice",
+                    "Choices": [{ "Variable": "$.isRunning", "BooleanEquals": false, "Next": "Run workers" }],
+                    "Default": "Test is still running"
+                  },
+                  "Test is still running": {
+                    "Type": "Fail",
+                    "Error": "TestAlreadyRunning",
+                    "Cause": "The same test is already running."
+                  },
+                  "Run workers": {
+                    "Type": "Task",
+                    "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+                    "InputPath": "$",
+                    "OutputPath": "$.Payload",
+                    "Parameters": {
+                      "FunctionName": "${TaskRunner.Arn}",
+                      "Payload.$": "$"
+                    },
+                    "Retry": [{
+                      "ErrorEquals": ["Lambda.ClientExecutionTimeoutException","Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException"],
+                      "IntervalSeconds": 2, "MaxAttempts": 6, "BackoffRate": 2
+                    }],
+                    "Next": "Requires leader?"
+                  },
+                  "Requires leader?": {
+                    "Type": "Choice",
+                    "Choices": [
+                      { "Variable": "$.isRunning", "BooleanEquals": false, "Next": "Cancel Test" },
+                      { "Variable": "$.taskIds", "IsPresent": false, "Next": "Wait specified test duration" }
+                    ],
+                    "Default": "Wait 1 minute - worker status"
+                  },
+                  "Wait 1 minute - worker status": {
+                    "Type": "Wait",
+                    "Seconds": 60,
+                    "Next": "Check worker status"
+                  },
+                  "Check worker status": {
+                    "Type": "Task",
+                    "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+                    "InputPath": "$",
+                    "OutputPath": "$.Payload",
+                    "Parameters": {
+                      "FunctionName": "${TaskStatusChecker.Arn}",
+                      "Payload.$": "$"
+                    },
+                    "Retry": [{
+                      "ErrorEquals": ["Lambda.ClientExecutionTimeoutException","Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException"],
+                      "IntervalSeconds": 2, "MaxAttempts": 6, "BackoffRate": 2
+                    }],
+                    "Next": "Are all workers running?"
+                  },
+                  "Are all workers running?": {
+                    "Type": "Choice",
+                    "Choices": [
+                      { "Variable": "$.isRunning", "BooleanEquals": false, "Next": "Cancel Test" },
+                      { "Variable": "$.numTasksRunning", "NumericEqualsPath": "$.numTasksTotal", "Next": "Run leader task" }
+                    ],
+                    "Default": "Wait 1 minute - worker status"
+                  },
+                  "Cancel Test": {
+                    "Type": "Task",
+                    "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+                    "InputPath": "$",
+                    "ResultPath": null,
+                    "Parameters": {
+                      "FunctionName": "${TaskCanceler.Arn}",
+                      "Payload.$": "$"
+                    },
+                    "Retry": [{
+                      "ErrorEquals": ["Lambda.ClientExecutionTimeoutException","Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException"],
+                      "IntervalSeconds": 2, "MaxAttempts": 6, "BackoffRate": 2
+                    }],
+                    "Next": "Map End"
+                  },
+                  "Run leader task": {
+                    "Type": "Task",
+                    "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+                    "InputPath": "$",
+                    "OutputPath": "$.Payload",
+                    "Parameters": {
+                      "FunctionName": "${TaskRunner.Arn}",
+                      "Payload.$": "$"
+                    },
+                    "Retry": [{
+                      "ErrorEquals": ["Lambda.ClientExecutionTimeoutException","Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException"],
+                      "IntervalSeconds": 2, "MaxAttempts": 6, "BackoffRate": 2
+                    }],
+                    "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Cancel Test" }],
+                    "Next": "Wait specified test duration"
+                  },
+                  "Wait specified test duration": {
+                    "Type": "Wait",
+                    "SecondsPath": "$.testDuration",
+                    "Next": "Check task status"
+                  },
+                  "Check task status": {
+                    "Type": "Task",
+                    "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+                    "InputPath": "$",
+                    "OutputPath": "$.Payload",
+                    "Parameters": {
+                      "FunctionName": "${TaskStatusChecker.Arn}",
+                      "Payload.$": "$"
+                    },
+                    "Retry": [{
+                      "ErrorEquals": ["Lambda.ClientExecutionTimeoutException","Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException"],
+                      "IntervalSeconds": 2, "MaxAttempts": 6, "BackoffRate": 2
+                    }],
+                    "Next": "Are all tasks done?"
+                  },
+                  "Wait 1 minute - task status": {
+                    "Type": "Wait",
+                    "Seconds": 60,
+                    "Next": "Check task status"
+                  },
+                  "Are all tasks done?": {
+                    "Type": "Choice",
+                    "Choices": [{ "Variable": "$.isRunning", "BooleanEquals": false, "Next": "Map End" }],
+                    "Default": "Wait 1 minute - task status"
+                  },
+                  "Map End": { "Type": "Pass", "End": true }
+                }
+              }
+            },
+            "Parse result": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+              "ResultPath": "$.parseResult",
+              "Parameters": {
+                "FunctionName": "${ResultsParser.Arn}",
+                "Payload": {
+                  "testTaskConfig.$": "$.testTaskConfig",
+                  "testId.$": "$.testId",
+                  "testType.$": "$.testType",
+                  "fileType.$": "$.fileType",
+                  "showLive.$": "$.showLive",
+                  "testDuration.$": "$.testDuration",
+                  "prefix.$": "$.prefix",
+                  "testRunId.$": "$.testRunId",
+                  "executionStart.$": "$$.Execution.StartTime"
+                }
+              },
+              "Retry": [{
+                "ErrorEquals": ["Lambda.ClientExecutionTimeoutException","Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException"],
+                "IntervalSeconds": 2, "MaxAttempts": 6, "BackoffRate": 2
+              }],
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Cleanup Metric Filters" }],
+              "Next": "Cleanup Metric Filters"
+            },
+            "Cleanup Metric Filters": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+              "ResultPath": null,
+              "Parameters": {
+                "FunctionName": "${MetricFilterCleaner.Arn}",
+                "Payload": {
+                  "testTaskConfig.$": "$.testTaskConfig",
+                  "testId.$": "$.testId"
+                }
+              },
+              "Retry": [{
+                "ErrorEquals": ["Lambda.ClientExecutionTimeoutException","Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException"],
+                "IntervalSeconds": 2, "MaxAttempts": 6, "BackoffRate": 2
+              }],
+              "Next": "Done"
+            },
+            "Done": { "Type": "Succeed" }
+          }
+        }
+
+  # =============================================================================
+  # API Services Lambda
+  # =============================================================================
+  ApiServicesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt ScenariosTable.Arn
+                  - !GetAtt HistoryTable.Arn
+                  - !Sub "${HistoryTable.Arn}/index/*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ScenariosBucket.Arn
+                  - !Sub "${ScenariosBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - ecs:ListTasks
+                  - ecs:ListClusters
+                  - ecs:DescribeTasks
+                  - ecs:DescribeClusters
+                  - ecs:DescribeTaskDefinition
+                  - ecs:StopTask
+                  - ecs:ListAccountSettings
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:DeleteMetricFilter
+                  - logs:DescribeMetricFilters
+                Resource: "*"
+              - Effect: Allow
+                Action: cloudwatch:DeleteDashboards
+                Resource: !Sub "arn:${AWS::Partition}:cloudwatch::${AWS::AccountId}:dashboard/EcsLoadTesting*"
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: { "cloudwatch:namespace": "distributed-load-testing" }
+              - Effect: Allow
+                Action: servicequotas:GetServiceQuota
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:StopExecution
+                  - states:DescribeExecution
+                Resource: !Ref StateMachine
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt TaskCanceler.Arn
+  ApiServices:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import os, json, uuid, boto3
+          from datetime import datetime, timezone
+          from decimal import Decimal
+
+          BUCKET   = os.environ['SCENARIOS_BUCKET']
+          TBL_NAME = os.environ['SCENARIOS_TABLE']
+          HIS_NAME = os.environ['HISTORY_TABLE']
+          SFN_ARN  = os.environ['STATE_MACHINE_ARN']
+          CAN_ARN  = os.environ['TASK_CANCELER_ARN']
+          REGION   = os.environ.get('AWS_REGION', 'cn-north-1')
+
+          ddb  = boto3.resource('dynamodb')
+          tbl  = ddb.Table(TBL_NAME)
+          hist = ddb.Table(HIS_NAME)
+          s3   = boto3.client('s3')
+          sfn  = boto3.client('stepfunctions')
+          lam  = boto3.client('lambda')
+          ecs  = boto3.client('ecs')
+
+          class DE(json.JSONEncoder):
+              """Handle DynamoDB Decimal in JSON."""
+              def default(self, o):
+                  if isinstance(o, Decimal):
+                      return int(o) if o == int(o) else float(o)
+                  return super().default(o)
+
+          def _to_ddb(x):
+              if isinstance(x, dict): return {k: _to_ddb(v) for k, v in x.items()}
+              if isinstance(x, list): return [_to_ddb(v) for v in x]
+              if isinstance(x, float): return Decimal(str(round(x, 6)))
+              if isinstance(x, int) and not isinstance(x, bool): return Decimal(x)
+              return x
+
+          def R(code, body):
+              return {
+                  'statusCode': code,
+                  'headers': {
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Origin,X-Requested-With,Content-Type,Accept,X-Api-Key',
+                  },
+                  'body': json.dumps(body, cls=DE, default=str),
+              }
+
+          def now_s():
+              return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+          def dur(s):
+              """Parse '60s' or '5m' to seconds."""
+              if not s: return 0
+              s = str(s).strip()
+              if s.endswith('m'): return int(s[:-1]) * 60
+              if s.endswith('s'): return int(s[:-1])
+              try: return int(s)
+              except: return 0
+
+          # ── Router ──────────────────────────────────────────────────────
+          def handler(event, context):
+              res = event.get('resource', '')
+              met = event.get('httpMethod', '')
+              pp  = event.get('pathParameters') or {}
+              body = {}
+              if event.get('body'):
+                  try: body = json.loads(event['body'])
+                  except: return R(400, 'Invalid JSON')
+              try:
+                  if res == '/scenarios':
+                      if met == 'GET':    return R(200, list_tests())
+                      if met == 'POST':   return R(200, create_test(body))
+                  elif res == '/scenarios/{testId}':
+                      tid = pp.get('testId', '')
+                      if met == 'GET':    return R(200, get_test(tid))
+                      if met == 'POST':   return R(200, cancel_test(tid))
+                      if met == 'DELETE': return R(200, delete_test(tid))
+                      if met == 'PUT':    return R(200, update_scenario(tid, body))
+                  elif res == '/stack-info':
+                      return R(200, {
+                          'region': REGION,
+                          'stack_name': os.environ.get('STACK_NAME', ''),
+                          'api_endpoint': os.environ.get('API_ENDPOINT', ''),
+                          'ecs_cluster': os.environ.get('ECS_CLUSTER', ''),
+                          'state_machine_arn': SFN_ARN,
+                          'scenarios_bucket': BUCKET,
+                          'console_bucket': os.environ.get('CONSOLE_BUCKET', ''),
+                          'scenarios_table': TBL_NAME,
+                          'history_table': HIS_NAME,
+                      })
+                  return R(200, {})
+              except Exception as e:
+                  print(f'ERROR: {e}')
+                  return R(400, str(e))
+
+          # ── GET /scenarios ──────────────────────────────────────────────
+          def list_tests():
+              items = []
+              params = {
+                  'ProjectionExpression': 'testId, testName, testDescription, #s, startTime',
+                  'ExpressionAttributeNames': {'#s': 'status'},
+                  'FilterExpression': 'NOT begins_with(testId, :p)',
+                  'ExpressionAttributeValues': {':p': 'region'},
+              }
+              r = tbl.scan(**params)
+              items.extend(r.get('Items', []))
+              while 'LastEvaluatedKey' in r:
+                  params['ExclusiveStartKey'] = r['LastEvaluatedKey']
+                  r = tbl.scan(**params)
+                  items.extend(r.get('Items', []))
+              items.sort(key=lambda x: x.get('startTime', ''), reverse=True)
+              return {'Items': items}
+
+          # ── POST /scenarios ─────────────────────────────────────────────
+          def create_test(cfg):
+              tid   = cfg.get('testId') or uuid.uuid4().hex[:10]
+              tname = cfg.get('testName', '')
+              tdesc = cfg.get('testDescription', '')
+              ttype = cfg.get('testType', 'simple')
+              ftype = 'none' if ttype == 'simple' else cfg.get('fileType', 'script')
+              show  = cfg.get('showLive', False)
+              tcs   = cfg.get('testTaskConfigs', [])
+              ts    = cfg.get('testScenario', {})
+
+              # Reporting section consumed by Taurus
+              ts['reporting'] = [{
+                  'module': 'final-stats', 'summary': True,
+                  'percentiles': True, 'summary-labels': True,
+                  'test-duration': True, 'dump-xml': '/tmp/artifacts/results.xml',
+              }]
+
+              # For script types, set the script reference so bzt/Taurus knows which file to run.
+              # Container downloads the file to CWD as {testId}.{ext}; scenario must reference it.
+              if ttype != 'simple':
+                  ext_map = {'jmeter': '.jmx', 'k6': '.js', 'locust': '.py'}
+                  ext = ext_map.get(ttype, '.jmx')
+                  scenario_name = ts.get('execution', [{}])[0].get('scenario', 'scenario1')
+                  if scenario_name not in ts.get('scenarios', {}):
+                      ts.setdefault('scenarios', {})[scenario_name] = {}
+                  ts['scenarios'][scenario_name]['script'] = f'{tid}{ext}'
+
+              exe = ts.get('execution', [{}])[0]
+              td  = dur(exe.get('hold-for', '0')) + dur(exe.get('ramp-up', '0'))
+
+              # Write scenario JSON to S3 per region
+              for tc in tcs:
+                  sc = dict(ts)
+                  sc['execution'] = [dict(exe,
+                      taskCount=tc.get('taskCount', 1),
+                      concurrency=tc.get('concurrency', 1))]
+                  s3.put_object(Bucket=BUCKET,
+                      Key=f'test-scenarios/{tid}-{tc["region"]}.json',
+                      Body=json.dumps(sc, cls=DE, default=str))
+
+              # Merge test + infra config for Step Functions
+              merged = []
+              for tc in tcs:
+                  infra = tbl.get_item(Key={'testId': f'region-{tc["region"]}'}).get('Item', {})
+                  merged.append({**tc, **infra})
+
+              # Start Step Functions execution
+              rid = uuid.uuid4().hex[:10]
+              ts_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%S')
+              pfx = f'{ts_iso}_{rid}'
+              sfn_input = {
+                  'testTaskConfig': merged, 'testId': tid, 'testType': ttype,
+                  'fileType': ftype, 'showLive': show, 'testDuration': td,
+                  'prefix': pfx, 'testRunId': rid,
+              }
+              sfn.start_execution(
+                  stateMachineArn=SFN_ARN,
+                  name=f'scenario-{tid}-run-{rid}',
+                  input=json.dumps(sfn_input, cls=DE, default=str))
+
+              # Write to DynamoDB
+              st = now_s()
+              tbl.update_item(
+                  Key={'testId': tid},
+                  UpdateExpression='SET #n=:n,#d=:d,#tc=:tc,#ts=:ts,#s=:s,#r=:r,#st=:st,#et=:et,#sl=:sl,#tt=:tt,#ft=:ft,#rid=:rid',
+                  ExpressionAttributeNames={
+                      '#n':'testName','#d':'testDescription','#tc':'testTaskConfigs',
+                      '#ts':'testScenario','#s':'status','#r':'results',
+                      '#st':'startTime','#et':'endTime','#sl':'showLive',
+                      '#tt':'testType','#ft':'fileType','#rid':'testRunId'},
+                  ExpressionAttributeValues={
+                      ':n':tname,':d':tdesc,':tc':tcs,
+                      ':ts':json.dumps(ts, cls=DE, default=str),
+                      ':s':'running',':r':{},':st':st,':et':'',
+                      ':sl':show,':tt':ttype,':ft':ftype,':rid':rid})
+              return {'testId':tid,'testName':tname,'testDescription':tdesc,
+                      'testType':ttype,'status':'running','startTime':st}
+
+          # ── GET /scenarios/{testId} ─────────────────────────────────────
+          def get_test(tid):
+              item = tbl.get_item(Key={'testId': tid}).get('Item')
+              if not item:
+                  raise Exception(f"TEST_NOT_FOUND: '{tid}' not found")
+              # Parse testScenario JSON string
+              if isinstance(item.get('testScenario'), str):
+                  try: item['testScenario'] = json.loads(item['testScenario'])
+                  except: pass
+              # Merge infra config into testTaskConfigs
+              for tc in (item.get('testTaskConfigs') or []):
+                  infra = tbl.get_item(Key={'testId': f'region-{tc["region"]}'}).get('Item', {})
+                  tc.update(infra)
+              # Query history table
+              hi = []
+              qp = {'KeyConditionExpression': 'testId = :t',
+                     'ExpressionAttributeValues': {':t': tid}}
+              r = hist.query(**qp)
+              hi.extend(r.get('Items', []))
+              while 'LastEvaluatedKey' in r:
+                  qp['ExclusiveStartKey'] = r['LastEvaluatedKey']
+                  r = hist.query(**qp)
+                  hi.extend(r.get('Items', []))
+              item['history'] = hi
+              # ECS task info when test is active
+              if item.get('status') in ('running', 'cancelling', 'provisioning'):
+                  item['tasksPerRegion'] = _ecs_tasks(item, tid)
+              return item
+
+          def _ecs_tasks(item, tid):
+              """List ECS tasks (RUNNING + STOPPED) matching this testId and testRunId."""
+              out = []
+              for tc in (item.get('testTaskConfigs') or []):
+                  cl  = tc.get('taskCluster', '')
+                  reg = tc.get('region', REGION)
+                  tasks = []
+                  if cl:
+                      try:
+                          arns = []
+                          pg = ecs.get_paginator('list_tasks')
+                          for status in ('RUNNING', 'STOPPED'):
+                              for page in pg.paginate(cluster=cl, desiredStatus=status):
+                                  arns.extend(page.get('taskArns', []))
+                          for i in range(0, len(arns), 100):
+                              desc = ecs.describe_tasks(cluster=cl, tasks=arns[i:i+100])
+                              for t in desc.get('tasks', []):
+                                  envs = {}
+                                  for co in t.get('overrides',{}).get('containerOverrides',[]):
+                                      for e in co.get('environment',[]):
+                                          envs[e.get('name')] = e.get('value')
+                                  if envs.get('TEST_ID') != tid:
+                                      continue
+                                  # Skip tasks from previous runs by matching TEST_RUN_ID
+                                  current_run_id = item.get('testRunId', '')
+                                  task_run_id = envs.get('TEST_RUN_ID', '')
+                                  if current_run_id and task_run_id and task_run_id != current_run_id:
+                                      continue
+                                  sa = t.get('startedAt','')
+                                  if hasattr(sa, 'isoformat'): sa = sa.isoformat()
+                                  tasks.append({
+                                      'lastStatus': t.get('lastStatus',''),
+                                      'startedAt': sa,
+                                      'containers': [{'lastStatus':c.get('lastStatus','')}
+                                                     for c in t.get('containers',[])]})
+                      except Exception as e:
+                          print(f'  ECS list error {reg}: {e}')
+                  out.append({'region': reg, 'tasks': tasks})
+              return out
+
+          # ── POST /scenarios/{testId} (cancel) ──────────────────────────
+          def cancel_test(tid):
+              item = tbl.get_item(Key={'testId': tid}).get('Item', {})
+              tcs = list(item.get('testTaskConfigs') or [])
+              for tc in tcs:
+                  infra = tbl.get_item(Key={'testId': f'region-{tc["region"]}'}).get('Item', {})
+                  tc.update(infra)
+              tbl.update_item(
+                  Key={'testId': tid},
+                  UpdateExpression='SET #s = :s',
+                  ExpressionAttributeNames={'#s': 'status'},
+                  ExpressionAttributeValues={':s': 'cancelling'})
+              lam.invoke(
+                  FunctionName=CAN_ARN, InvocationType='Event',
+                  Payload=json.dumps({'testId': tid, 'testTaskConfig': tcs},
+                                     cls=DE, default=str))
+              return 'cancelling'
+
+          # ── DELETE /scenarios/{testId} ──────────────────────────────────
+          def delete_test(tid):
+              item = tbl.get_item(Key={'testId': tid}).get('Item', {})
+              st = item.get('status', '')
+              if st and st not in ('complete', 'cancelled', 'failed'):
+                  raise Exception(f"TEST_RUNNING: '{tid}' is currently {st}")
+              # Delete scenario entry
+              tbl.delete_item(Key={'testId': tid})
+              # Delete history entries
+              hi = []
+              qp = {'KeyConditionExpression': 'testId = :t',
+                     'ExpressionAttributeValues': {':t': tid},
+                     'ProjectionExpression': 'testId, testRunId'}
+              r = hist.query(**qp)
+              hi.extend(r.get('Items', []))
+              while 'LastEvaluatedKey' in r:
+                  qp['ExclusiveStartKey'] = r['LastEvaluatedKey']
+                  r = hist.query(**qp)
+                  hi.extend(r.get('Items', []))
+              with hist.batch_writer() as bw:
+                  for h in hi:
+                      bw.delete_item(Key={'testId': h['testId'], 'testRunId': h['testRunId']})
+              # Delete S3 test-scenario files
+              try:
+                  r = s3.list_objects_v2(Bucket=BUCKET, Prefix=f'test-scenarios/{tid}')
+                  for o in r.get('Contents', []):
+                      s3.delete_object(Bucket=BUCKET, Key=o['Key'])
+              except: pass
+              return 'success'
+
+          ALLOWED_PUT_FIELDS = {'awsContext', 'aiAnalysis', 'testPrompt'}
+
+          def update_scenario(tid, body):
+              fields = {k: v for k, v in body.items() if k in ALLOWED_PUT_FIELDS}
+              if not fields:
+                  raise Exception('No valid fields to update')
+              expr_parts = []
+              names = {}
+              vals = {}
+              for i, (k, v) in enumerate(fields.items()):
+                  alias = f'#f{i}'
+                  val_alias = f':v{i}'
+                  names[alias] = k
+                  vals[val_alias] = _to_ddb(v)
+                  expr_parts.append(f'{alias} = {val_alias}')
+              tbl.update_item(
+                  Key={'testId': tid},
+                  UpdateExpression='SET ' + ', '.join(expr_parts),
+                  ExpressionAttributeNames=names,
+                  ExpressionAttributeValues=vals)
+              return 'success'
+
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 120
+      MemorySize: 512
+      Role: !GetAtt ApiServicesRole.Arn
+      Environment:
+        Variables:
+          SCENARIOS_BUCKET: !Ref ScenariosBucket
+          CONSOLE_BUCKET: !Ref ConsoleBucket
+          SCENARIOS_TABLE: !Ref ScenariosTable
+          HISTORY_TABLE: !Ref HistoryTable
+          STATE_MACHINE_ARN: !Ref StateMachine
+          TASK_CANCELER_ARN: !GetAtt TaskCanceler.Arn
+          ECS_CLUSTER: !Ref EcsCluster
+          STACK_NAME: !Ref AWS::StackName
+          API_ENDPOINT: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com.cn/prod"
+
+  # =============================================================================
+  # API Gateway (REST, API Key required on all non-OPTIONS methods)
+  # =============================================================================
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      Description: "Distributed Load Testing API - China region adapted v4.0.15"
+      EndpointConfiguration: { Types: [REGIONAL] }
+
+  # Integration URI helper - used by every method below
+  # Lambda invoke ARN for API Gateway must use this format.
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ApiServices.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/*"
+
+  # ---------- /scenarios ----------
+  ScenariosResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: scenarios
+
+  ScenariosAny:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ScenariosResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiServices.Arn}/invocations"
+
+  ScenariosOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ScenariosResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode":200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Authorization,Content-Type,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # ---------- /scenarios/{testId} ----------
+  ScenariosTestIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ScenariosResource
+      PathPart: "{testId}"
+
+  ScenariosTestIdAny:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ScenariosTestIdResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiServices.Arn}/invocations"
+
+  ScenariosTestIdOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ScenariosTestIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode":200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Authorization,Content-Type,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # ---------- /scenarios/{testId}/testruns ----------
+  TestRunsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ScenariosTestIdResource
+      PathPart: testruns
+
+  TestRunsAny:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref TestRunsResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiServices.Arn}/invocations"
+
+  TestRunsOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref TestRunsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode":200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Authorization,Content-Type,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # ---------- /scenarios/{testId}/testruns/{testRunId} ----------
+  TestRunIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref TestRunsResource
+      PathPart: "{testRunId}"
+
+  TestRunIdAny:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref TestRunIdResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiServices.Arn}/invocations"
+
+  TestRunIdOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref TestRunIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode":200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Authorization,Content-Type,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # ---------- /scenarios/{testId}/baseline ----------
+  BaselineResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ScenariosTestIdResource
+      PathPart: baseline
+
+  BaselineAny:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref BaselineResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiServices.Arn}/invocations"
+
+  BaselineOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref BaselineResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode":200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Authorization,Content-Type,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # ---------- /tasks, /regions, /vCPUDetails, /stack-info ----------
+  TasksResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: tasks
+
+  TasksAny:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref TasksResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiServices.Arn}/invocations"
+
+  TasksOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref TasksResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode":200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Authorization,Content-Type,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  RegionsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: regions
+
+  RegionsAny:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref RegionsResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiServices.Arn}/invocations"
+
+  RegionsOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref RegionsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode":200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Authorization,Content-Type,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  VcpuResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: vCPUDetails
+
+  VcpuAny:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref VcpuResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiServices.Arn}/invocations"
+
+  VcpuOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref VcpuResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode":200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Authorization,Content-Type,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  StackInfoResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: stack-info
+
+  StackInfoAny:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref StackInfoResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiServices.Arn}/invocations"
+
+  StackInfoOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref StackInfoResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode":200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Authorization,Content-Type,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # ---------- /aws-context ----------
+  AwsContextResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: aws-context
+
+  AwsContextInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AwsContext.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/aws-context"
+
+  AwsContextPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AwsContextResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AwsContext.Arn}/invocations"
+
+  AwsContextOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AwsContextResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode":200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Authorization,Content-Type,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # ---------- /ai-analyze ----------
+  AiAnalyzeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: ai-analyze
+
+  AiProxyInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AiProxy.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/ai-analyze"
+
+  AiAnalyzePost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AiAnalyzeResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AiProxy.Arn}/invocations"
+
+  AiAnalyzeOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AiAnalyzeResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode":200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Authorization,Content-Type,X-Amz-Date,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # ---------- /upload-url ----------
+  UploadUrlResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: upload-url
+
+  UploadUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt UploadUrl.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/upload-url"
+
+  UploadUrlGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UploadUrlResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UploadUrl.Arn}/invocations"
+
+  UploadUrlOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UploadUrlResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode":200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # ---------- Deployment ----------
+  # NOTE: Bump the Description below whenever you add/remove a Method or Resource
+  # under this API. Otherwise CFN won't create a new deployment and new routes
+  # will return 403 "Missing Authentication Token".
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ScenariosAny
+      - ScenariosOptions
+      - ScenariosTestIdAny
+      - ScenariosTestIdOptions
+      - TestRunsAny
+      - TestRunsOptions
+      - TestRunIdAny
+      - TestRunIdOptions
+      - BaselineAny
+      - BaselineOptions
+      - TasksAny
+      - TasksOptions
+      - RegionsAny
+      - RegionsOptions
+      - VcpuAny
+      - VcpuOptions
+      - StackInfoAny
+      - StackInfoOptions
+      - AwsContextPost
+      - AwsContextOptions
+      - AiAnalyzePost
+      - AiAnalyzeOptions
+      - UploadUrlGet
+      - UploadUrlOptions
+    Properties:
+      RestApiId: !Ref RestApi
+      Description: "rev-2026-05-25-api-key-auth"
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+
+  # ---------- API Key authentication ----------
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiStage
+    Properties:
+      UsagePlanName: !Sub "${AWS::StackName}-usage-plan"
+      ApiStages:
+        - ApiId: !Ref RestApi
+          Stage: prod
+
+  ApiKeyResource:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub "${AWS::StackName}-api-key"
+      Enabled: true
+
+  ApiUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKeyResource
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiUsagePlan
+
+Outputs:
+  ConsoleURL:
+    Description: "Frontend web URL (ALB)"
+    Value: !If
+      - EnableHTTPS
+      - !Sub "https://${WebAlb.DNSName}"
+      - !Sub "http://${WebAlb.DNSName}"
+
+  ConsoleBucketName:
+    Description: "S3 bucket that backs the frontend. Upload index.html here."
+    Value: !Ref ConsoleBucket
+
+  ApiEndpoint:
+    Description: "REST API base URL (requires x-api-key header)"
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com.cn/prod"
+
+  ApiKeyId:
+    Description: "API Key ID (not the secret). Get the secret value with this command:"
+    Value: !Ref ApiKeyResource
+
+  ApiKeyCommand:
+    Description: "Run this command to retrieve the actual API Key secret for frontend login"
+    Value: !Sub "aws apigateway get-api-key --api-key ${ApiKeyResource} --include-value --query value --output text --region ${AWS::Region}"
+
+  ScenariosBucketName:
+    Description: "S3 bucket where test scripts and results are stored"
+    Value: !Ref ScenariosBucket
+
+  ScenariosTableName:
+    Value: !Ref ScenariosTable
+
+  HistoryTableName:
+    Value: !Ref HistoryTable
+
+  EcsClusterName:
+    Value: !Ref EcsCluster
+
+  StateMachineArn:
+    Value: !Ref StateMachine
